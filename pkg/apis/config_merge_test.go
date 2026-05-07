@@ -130,6 +130,24 @@ func TestMergeNetworkConfig(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "merge ipam ranges without duplicates",
+			user: &NetworkConfig{
+				Interface: InterfaceConfig{
+					IPAM: &IPAMConfig{Ranges: []string{"10.0.1.0/24", "10.0.2.0/24"}},
+				},
+			},
+			cloud: &NetworkConfig{
+				Interface: InterfaceConfig{
+					IPAM: &IPAMConfig{Ranges: []string{"10.0.0.0/24", "10.0.1.0/24"}},
+				},
+			},
+			want: &NetworkConfig{
+				Interface: InterfaceConfig{
+					IPAM: &IPAMConfig{Ranges: []string{"10.0.0.0/24", "10.0.1.0/24", "10.0.2.0/24"}},
+				},
+			},
+		},
 	}
 
 	for _, tt := range tests {

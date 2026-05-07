@@ -276,3 +276,35 @@ func TestPublishResourcesMetrics(t *testing.T) {
 		}
 	})
 }
+
+func TestUnprepareResourceClaimReleasesIPAM(t *testing.T) {
+	store := mustNewPodConfigStore()
+	np := &NetworkDriver{
+		podConfigStore: store,
+		ipam:           newLocalIPAM(nil),
+	}
+
+	iface := &apis.InterfaceConfig{IPAM: &apis.IPAMConfig{Ranges: []string{"10.30.0.0/30"}}}
+	allocated, err := np.ipam.Allocate(types.NamespacedName{Namespace: "ns", Name: "claim1"}, "pod-a", "dev0", iface)
+	if err != nil {
+		t.Fatalf("failed to pre-allocate address: %v", err)
+	}
+
+	store.SetDeviceConfig("pod-a", "dev0", DeviceConfig{
+		Claim:                  types.NamespacedName{Namespace: "ns", Name: "claim1"},
+		AllocatedIPAMAddresses: allocated,
+	})
+
+	if err := np.unprepareResourceClaim(context.Background(), kubeletplugin.NamespacedObject{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "claim1"}}); err != nil {
+		t.Fatalf("unprepareResourceClaim failed: %v", err)
+	}
+
+	iface2 := &apis.InterfaceConfig{IPAM: &apis.IPAMConfig{Ranges: []string{"10.30.0.0/30"}}}
+	reallocated, err := np.ipam.Allocate(types.NamespacedName{Namespace: "ns", Name: "claim2"}, "pod-b", "dev0", iface2)
+	if err != nil {
+		t.Fatalf("failed to allocate after release: %v", err)
+	}
+	if got, want := reallocated[0], allocated[0]; got != want {
+		t.Fatalf("unexpected reallocation %q, want %q", got, want)
+	}
+}

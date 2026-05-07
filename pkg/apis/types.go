@@ -44,6 +44,10 @@ type InterfaceConfig struct {
 	// If not specified, DraNet may use or derive a name from the original interface.
 	Name string `json:"name,omitempty"`
 
+	// IPAM defines automatic IP address allocation from one or more CIDR ranges.
+	// This is mutually exclusive with static Addresses and DHCP.
+	IPAM *IPAMConfig `json:"ipam,omitempty"`
+
 	// Addresses is a list of IP addresses in CIDR format (e.g., "192.168.1.10/24")
 	// to be assigned to the interface.
 	Addresses []string `json:"addresses,omitempty"`
@@ -86,6 +90,15 @@ type InterfaceConfig struct {
 	// If provided, the interface will be enslaved to a VRF device with this name.
 	// This enables grouping multiple network interfaces into the same VRF.
 	VRF *VRFConfig `json:"vrf,omitempty"`
+}
+
+// IPAMConfig represents automatic address allocation settings.
+// The allocator picks one free IP from the configured ranges and assigns it
+// to the interface using the corresponding prefix length.
+type IPAMConfig struct {
+	// Ranges is the list of CIDR pools used for automatic allocation.
+	// Example: ["10.0.0.0/24", "10.0.1.0/24"]
+	Ranges []string `json:"ranges,omitempty"`
 }
 
 // VRFConfig represents the configuration for a Virtual Routing and Forwarding domain.

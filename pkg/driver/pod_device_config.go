@@ -56,6 +56,10 @@ type DeviceConfig struct {
 	// RDMADevice holds RDMA-specific configurations if the network device
 	// has associated RDMA capabilities.
 	RDMADevice RDMAConfig `json:"rdmaDevice,omitempty"`
+
+	// AllocatedIPAMAddresses are the addresses dynamically allocated for this
+	// device and tracked for release during unprepare.
+	AllocatedIPAMAddresses []string `json:"allocatedIPAMAddresses,omitempty"`
 }
 
 // RDMAConfig contains parameters for setting up an RDMA device associated
@@ -282,4 +286,20 @@ func (s *PodConfigStore) DeleteClaim(claim types.NamespacedName) []types.UID {
 		delete(s.configs, uid)
 	}
 	return podsToDelete
+}
+
+// GetClaimDeviceConfigs returns a copy of all DeviceConfigs associated with a claim.
+func (s *PodConfigStore) GetClaimDeviceConfigs(claim types.NamespacedName) []DeviceConfig {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var configs []DeviceConfig
+	for _, podConfig := range s.configs {
+		for _, config := range podConfig.DeviceConfigs {
+			if config.Claim == claim {
+				configs = append(configs, config)
+			}
+		}
+	}
+	return configs
 }

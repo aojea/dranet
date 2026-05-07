@@ -39,6 +39,10 @@ type InterfaceConfig struct {
 	// If not specified, DRANET may use or derive a name from the original interface.
 	Name string `json:"name,omitempty"`
 
+	// IPAM defines automatic IP address allocation from one or more CIDR ranges.
+	// This is mutually exclusive with static Addresses and DHCP.
+	IPAM *IPAMConfig `json:"ipam,omitempty"`
+
 	// Addresses is a list of IP addresses in CIDR format (e.g., "192.168.1.10/24")
 	// to be assigned to the interface.
 	Addresses []string `json:"addresses,omitempty"`
@@ -65,16 +69,27 @@ type InterfaceConfig struct {
 	// Managed by `ip link set <dev> gro_ipv4_max_size <val>`. For enabling Big TCP.
 	GROIPv4MaxSize *int32 `json:"groIPv4MaxSize,omitempty"`
 }
+
+type IPAMConfig struct {
+	// Ranges is the list of CIDR pools used for automatic allocation.
+	// Example: ["10.0.0.0/24", "10.0.1.0/24"]
+	Ranges []string `json:"ranges,omitempty"`
+}
 ```
 
 * **name** (string, optional): The logical name that the interface will have inside the Pod (e.g., "eth0", "enp0s3"). If not specified, DRANET will keep the original name if compliant.
+* **ipam** (object, optional): Automatic per-node IP allocation settings.
+* **ipam.ranges** ([]string, required when ipam is set): One or more CIDR ranges used by the node-local allocator.
 * **addresses** ([]string, optional): A list of IP addresses in CIDR format (e.g., "192.168.1.10/24", "2001:db8::1/64") to be assigned to the interface.
+* **dhcp** (bool, optional): Request DHCP-based configuration for the interface.
 * **mtu** (int32, optional): The Maximum Transmission Unit for the interface.
 * **hardwareAddr** (string, optional): The MAC address of the interface.
 * **gsoMaxSize** (int32, optional): The maximum Generic Segmentation Offload size for IPv6.
 * **groMaxSize** (int32, optional): The maximum Generic Receive Offload size for IPv6.
 * **gsoIPv4MaxSize** (int32, optional): The maximum Generic Segmentation Offload size for IPv4.
 * **groIPv4MaxSize** (int32, optional): The maximum Generic Receive Offload size for IPv4.
+
+`ipam`, `addresses`, and `dhcp: true` are mutually exclusive options.
 
 #### Route Configuration (RouteConfig)
 

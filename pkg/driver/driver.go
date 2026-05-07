@@ -108,6 +108,7 @@ type NetworkDriver struct {
 	dbPath         string // path for persistent bbolt database; empty means in-memory
 
 	clock clock.WithTicker // Injectable clock for testing
+	ipam  *localIPAM
 }
 
 type Option func(*NetworkDriver)
@@ -152,6 +153,7 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 		return nil, fmt.Errorf("failed to initialize pod config store: %v", err)
 	}
 	plugin.podConfigStore = store
+	plugin.ipam = newLocalIPAM(plugin.podConfigStore)
 
 	driverPluginPath := filepath.Join(kubeletPluginPath, driverName)
 	err = os.MkdirAll(driverPluginPath, 0750)

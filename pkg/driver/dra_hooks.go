@@ -157,6 +157,9 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 		klog.Infof("no pods allocated to claim %s/%s", claim.Namespace, claim.Name)
 		return kubeletplugin.PrepareResult{}
 	}
+	if np.ipam == nil {
+		np.ipam = newLocalIPAM(np.podConfigStore)
+	}
 
 	nlHandle, err := nlwrap.NewHandle()
 	if err != nil {
@@ -288,7 +291,7 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 				deviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses = []string{ip}
 				deviceCfg.NetworkInterfaceConfigInPod.Routes = append(deviceCfg.NetworkInterfaceConfigInPod.Routes, routes...)
 			}
-		} else if len(deviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses) == 0 {
+		} else if deviceCfg.NetworkInterfaceConfigInPod.Interface.IPAM == nil && len(deviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses) == 0 {
 			// If there is no custom addresses and no DHCP, then use the existing ones
 			// get the existing IP addresses
 			nlAddresses, err := nlHandle.AddrList(link, netlink.FAMILY_ALL)
@@ -398,7 +401,20 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 		// TODO: support for multiple pods sharing the same device
 		// we'll create the subinterface here
 		for _, uid := range podUIDs {
-			if err := np.podConfigStore.SetDeviceConfig(uid, result.Device, deviceCfg); err != nil {
+			podDeviceCfg := deviceCfg
+			if podDeviceCfg.NetworkInterfaceConfigInPod.Interface.IPAM != nil {
+				allocated, err := np.ipam.Allocate(types.NamespacedName{Namespace: claim.Namespace, Name: claim.Name}, uid, result.Device, &podDeviceCfg.NetworkInterfaceConfigInPod.Interface)
+				if err != nil {
+					errorList = append(errorList, err)
+					continue
+				}
+				podDeviceCfg.AllocatedIPAMAddresses = allocated
+			}
+
+			if err := np.podConfigStore.SetDeviceConfig(uid, result.Device, podDeviceCfg); err != nil {
+				if len(podDeviceCfg.AllocatedIPAMAddresses) > 0 {
+					np.ipam.ReleaseAllocated(podDeviceCfg.AllocatedIPAMAddresses)
+				}
 				errorList = append(errorList, fmt.Errorf("failed to persist device config for pod %s device %s: %v", uid, result.Device, err))
 			}
 		}
@@ -458,6 +474,14 @@ func (np *NetworkDriver) unprepareResourceClaims(ctx context.Context, claims []k
 }
 
 func (np *NetworkDriver) unprepareResourceClaim(_ context.Context, claim kubeletplugin.NamespacedObject) error {
+	if np.ipam == nil {
+		np.ipam = newLocalIPAM(np.podConfigStore)
+	}
+	if np.podConfigStore != nil {
+		for _, cfg := range np.podConfigStore.GetClaimDeviceConfigs(claim.NamespacedName) {
+			np.ipam.ReleaseAllocated(cfg.AllocatedIPAMAddresses)
+		}
+	}
 	np.podConfigStore.DeleteClaim(claim.NamespacedName)
 	return nil
 }

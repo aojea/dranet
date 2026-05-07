@@ -48,6 +48,9 @@ func MergeNetworkConfig(user, cloud *NetworkConfig) *NetworkConfig {
 	// Deduplicate slices where order or uniqueness matters.
 	// For addresses, we just unique them.
 	merged.Interface.Addresses = deduplicateStrings(merged.Interface.Addresses)
+	if merged.Interface.IPAM != nil {
+		merged.Interface.IPAM.Ranges = deduplicateStrings(merged.Interface.IPAM.Ranges)
+	}
 
 	// For Routes, deduplicate by destination (user wins, which were appended last, so we iterate backwards).
 	merged.Routes = deduplicateRoutes(merged.Routes)

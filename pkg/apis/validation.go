@@ -145,8 +145,27 @@ func validateInterfaceConfig(cfg *InterfaceConfig, fieldPath string) (allErrors 
 		}
 	}
 
+	if cfg.IPAM != nil {
+		if len(cfg.IPAM.Ranges) == 0 {
+			allErrors = append(allErrors, fmt.Errorf("%s.ipam.ranges: at least one CIDR range must be specified", fieldPath))
+		}
+		for i, cidr := range cfg.IPAM.Ranges {
+			if _, err := netip.ParsePrefix(cidr); err != nil {
+				allErrors = append(allErrors, fmt.Errorf("%s.ipam.ranges[%d]: invalid CIDR format '%s': %w", fieldPath, i, cidr, err))
+			}
+		}
+	}
+
 	if cfg.DHCP != nil && *cfg.DHCP && len(cfg.Addresses) > 0 {
 		allErrors = append(allErrors, fmt.Errorf("%s: dhcp and addresses are mutually exclusive", fieldPath))
+	}
+
+	if cfg.IPAM != nil && len(cfg.Addresses) > 0 {
+		allErrors = append(allErrors, fmt.Errorf("%s: ipam and addresses are mutually exclusive", fieldPath))
+	}
+
+	if cfg.IPAM != nil && cfg.DHCP != nil && *cfg.DHCP {
+		allErrors = append(allErrors, fmt.Errorf("%s: ipam and dhcp are mutually exclusive", fieldPath))
 	}
 
 	if cfg.MTU != nil {

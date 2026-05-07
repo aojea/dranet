@@ -355,3 +355,29 @@ func TestPodConfigStore_NoDuplicateDevices(t *testing.T) {
 		t.Errorf("Device %s not found in pod configs", deviceName2)
 	}
 }
+
+func TestPodConfigStore_GetClaimDeviceConfigs(t *testing.T) {
+	store := mustNewPodConfigStore()
+	claim1 := types.NamespacedName{Namespace: "ns1", Name: "claim1"}
+	claim2 := types.NamespacedName{Namespace: "ns1", Name: "claim2"}
+
+	store.SetDeviceConfig("pod-1", "dev0", DeviceConfig{Claim: claim1, AllocatedIPAMAddresses: []string{"10.0.0.2/24"}})
+	store.SetDeviceConfig("pod-2", "dev1", DeviceConfig{Claim: claim1, AllocatedIPAMAddresses: []string{"10.0.0.3/24"}})
+	store.SetDeviceConfig("pod-3", "dev2", DeviceConfig{Claim: claim2, AllocatedIPAMAddresses: []string{"10.0.1.2/24"}})
+
+	configs := store.GetClaimDeviceConfigs(claim1)
+	if len(configs) != 2 {
+		t.Fatalf("expected 2 configs for claim1, got %d", len(configs))
+	}
+
+	got := map[string]bool{}
+	for _, cfg := range configs {
+		for _, addr := range cfg.AllocatedIPAMAddresses {
+			got[addr] = true
+		}
+	}
+
+	if !got["10.0.0.2/24"] || !got["10.0.0.3/24"] {
+		t.Fatalf("unexpected addresses returned: %#v", got)
+	}
+}
