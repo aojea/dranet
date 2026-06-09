@@ -26,6 +26,7 @@ import (
 	"testing"
 	"time"
 
+	"sigs.k8s.io/dranet/pkg/apis"
 	"sigs.k8s.io/dranet/pkg/cloudprovider"
 )
 
@@ -109,7 +110,7 @@ func TestWebhookCapabilitiesAndPost(t *testing.T) {
 				t.Errorf("Expected GetDeviceAttributes to fail and return nil due to lack of capability")
 			}
 
-			_, err = provider.GetProfileConfig(id, "test-profile", "claim-123")
+			_, err = provider.GetProfileConfig(id, "claim-123", nil)
 			if tt.expectProfileSuccess && err != nil {
 				t.Errorf("Expected GetProfileConfig to succeed, got error: %v", err)
 			} else if !tt.expectProfileSuccess && err == nil {
@@ -283,5 +284,52 @@ func TestWebhookGetDeviceAttributesSerialization(t *testing.T) {
 
 	if attr.StringValue == nil || *attr.StringValue != "python" {
 		t.Errorf("Expected string value 'python', got %v", attr.StringValue)
+	}
+}
+
+func TestWebhookGetProfileConfigPassesConfig(t *testing.T) {
+	ctx := context.Background()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == PathHealth {
+			json.NewEncoder(w).Encode(Capabilities{CloudProvider: true, ProfileProvider: true})
+			return
+		}
+		if r.URL.Path == PathGetProfileConfig {
+			var req ProfileRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			// Validate that the config is passed and contains the expected profile name
+			if req.Config == nil || req.Config.Profile != "test-profile" {
+				w.WriteHeader(http.StatusBadRequest)
+				w.Write([]byte(`{"error": "expected config with profile 'test-profile'"}`))
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"interface": {"mtu": 1450}}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	provider, err := NewWebhookProvider(ctx, srv.URL)
+	if err != nil {
+		t.Fatalf("NewWebhookProvider failed: %v", err)
+	}
+
+	testConfig := &apis.NetworkConfig{
+		Profile: "test-profile",
+	}
+
+	conf, err := provider.GetProfileConfig(cloudprovider.DeviceIdentifiers{}, "claim-123", testConfig)
+	if err != nil {
+		t.Fatalf("Expected GetProfileConfig to succeed, got error: %v", err)
+	}
+
+	if conf == nil || conf.Interface.MTU == nil || *conf.Interface.MTU != 1450 {
+		t.Errorf("Expected GetProfileConfig to return MTU 1450, got %v", conf)
 	}
 }

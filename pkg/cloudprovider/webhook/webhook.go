@@ -52,8 +52,8 @@ type Capabilities struct {
 // API Contracts (JSON payloads)
 type ProfileRequest struct {
 	Device   cloudprovider.DeviceIdentifiers `json:"device"`
-	Profile  string                          `json:"profile"`
 	ClaimUID types.UID                       `json:"claim_uid"`
+	Config   *apis.NetworkConfig             `json:"config,omitempty"`
 }
 
 // WebhookProvider implements CloudInstance and ProfileProvider via HTTP POST.
@@ -230,27 +230,27 @@ func (p *WebhookProvider) GetDeviceConfig(id cloudprovider.DeviceIdentifiers) *a
 }
 
 // GetProfileConfig asks the webhook to resolve the logical profile (e.g., allocate an IP).
-func (p *WebhookProvider) GetProfileConfig(id cloudprovider.DeviceIdentifiers, profile string, claimUID types.UID) (*apis.NetworkConfig, error) {
+func (p *WebhookProvider) GetProfileConfig(id cloudprovider.DeviceIdentifiers, claimUID types.UID, config *apis.NetworkConfig) (*apis.NetworkConfig, error) {
 	req := ProfileRequest{
 		Device:   id,
-		Profile:  profile,
 		ClaimUID: claimUID,
+		Config:   config,
 	}
 
-	var config apis.NetworkConfig
-	err := p.post(PathGetProfileConfig, req, &config)
+	var respConfig apis.NetworkConfig
+	err := p.post(PathGetProfileConfig, req, &respConfig)
 	if err != nil {
 		return nil, err
 	}
-	return &config, nil
+	return &respConfig, nil
 }
 
 // ReleaseProfileConfig tells the webhook to free stateful resources (e.g., release IP).
-func (p *WebhookProvider) ReleaseProfileConfig(id cloudprovider.DeviceIdentifiers, profile string, claimUID types.UID) error {
+func (p *WebhookProvider) ReleaseProfileConfig(id cloudprovider.DeviceIdentifiers, claimUID types.UID, config *apis.NetworkConfig) error {
 	req := ProfileRequest{
 		Device:   id,
-		Profile:  profile,
 		ClaimUID: claimUID,
+		Config:   config,
 	}
 
 	return p.post(PathReleaseProfileConfig, req, nil)

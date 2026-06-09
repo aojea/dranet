@@ -39,14 +39,14 @@ sequenceDiagram
     W-->>D: Baseline Hardware Settings (MTU, baseline routes)
     
     note over D,W: Profile Provider Phase (User Intent Resolution)
-    D->>W: POST /GetProfileConfig (Device ID, Profile Name)
+    D->>W: POST /GetProfileConfig (Device ID, full NetworkConfig containing Profile Name)
     W-->>D: Logical Network Config (Assigned IPs, custom routes)
     
     note over D: DRANET merges all configs
     note over D: DRANET programs the interface statically
     
     note over D,W: Teardown Phase
-    D->>W: POST /ReleaseProfileConfig (Device ID, Profile Name)
+    D->>W: POST /ReleaseProfileConfig (Device ID, full NetworkConfig)
     W-->>D: 200 OK (Resources released)
 ```
 
@@ -88,8 +88,26 @@ Your webhook server should implement the following HTTP `POST` endpoints based o
 
 #### Profile Provider API (`profileProvider: true`)
 
-* `POST /GetProfileConfig`: Allocates and returns the logical profile configuration (e.g., allocating an IP address from IPAM).
-* `POST /ReleaseProfileConfig`: Frees stateful resources (e.g., releasing an IP address).
+* `POST /GetProfileConfig`: Allocates and returns the logical profile configuration (e.g., allocating an IP address from IPAM). 
+
+  **Mutation & Validation**: The webhook receives the *entire* `NetworkConfig` (combined from user and cloud intents) as context. Unlike standard Mutating Webhooks on the API server, this node-level webhook cannot directly mutate the opaque config object in the API server. Instead, it computes and returns the *resolved profile parameters* (like the chosen IP), which DRANET then merges into the final configuration. Passing the full configuration gives the webhook the power of a Validating Admission Controller.
+
+  **Denying Configurations**: The webhook can deny a configuration if the user's intent is invalid or conflicts with its rules. It communicates this by returning an appropriate HTTP error code. When a webhook returns a non-200 status code, DRANET aborts the network setup during the `NodePrepareResources` phase (before the pod sandbox is even created).
+
+  **Handling Errors & HTTP Codes**:
+  * **200 OK**: Request successful. Returns the allocated logical configuration.
+  * **400 Bad Request**: The provided `NetworkConfig` is malformed or requests invalid parameters (e.g., requesting an IP outside the allowed subnet). The `NodePrepareResources` call will fail.
+  * **404 Not Found**: The requested profile does not exist in the webhook provider.
+  * **409 Conflict**: The request conflicts with current state (e.g., the statically requested IP is already in use).
+  * **500 Internal Server Error**: The webhook failed to allocate resources. DRANET treats this as a temporary failure, and the kubelet will typically retry the `NodePrepareResources` call.
+  * **Network Failures**: If DRANET cannot reach the webhook due to a network timeout or connection refused, it also fails the `NodePrepareResources` call, and kubelet will continually retry.
+
+  **Trade-offs & Downsides (Node-level vs. API-level Validation)**:
+  Because this validation happens at the *node level* during DRA `NodePrepareResources` (rather than at the API server via standard Admission Webhooks), there are important trade-offs to consider:
+  * **Late Feedback**: If a configuration is invalid, the API server will still accept the Pod. The failure happens asynchronously when the pod is scheduled and the kubelet attempts to prepare resources. Users won't see an immediate error on `kubectl apply`; the pod will remain in a `Pending` state, and they must inspect Pod events to see the `NodePrepareResources` failure.
+  * **Kubelet Retry Loops**: Standard Kubernetes behavior is to retry failed resource preparations. A persistent denial (like a 400 Bad Request) will cause the Kubelet to continuously retry `NodePrepareResources`, which can generate unnecessary load on the node and webhook server compared to an upfront API rejection.
+
+* `POST /ReleaseProfileConfig`: Frees stateful resources (e.g., releasing an IP address). Also receives the full `NetworkConfig`. Should return `200 OK` on success or if the resource was already released (idempotency).
 
 ### Reference Implementation
 

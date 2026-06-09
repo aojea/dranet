@@ -47,9 +47,9 @@ type ProfileProvider interface {
 	// GetProfileConfig resolves a logical profile name for a given hardware device
 	// and claim. It performs stateful operations (like allocating an IP address)
 	// and returns the resulting network config to be merged with the base config.
-	GetProfileConfig(id DeviceIdentifiers, profile string, claimUID types.UID) (*apis.NetworkConfig, error)
+	GetProfileConfig(id DeviceIdentifiers, claimUID types.UID, config *apis.NetworkConfig) (*apis.NetworkConfig, error)
 
 	// ReleaseProfileConfig frees any stateful resources (like IP leases) that were
 	// previously allocated for the given claim and profile.
-	ReleaseProfileConfig(id DeviceIdentifiers, profile string, claimUID types.UID) error
+	ReleaseProfileConfig(id DeviceIdentifiers, claimUID types.UID, config *apis.NetworkConfig) error
 }

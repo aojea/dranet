@@ -51,8 +51,8 @@ type fakeInventoryDB struct {
 	GetDeviceConfigFunc func(deviceName string) (*apis.NetworkConfig, bool)
 	GetNetInterfaceNameFunc func(deviceName string) (string, error)
 	IsIBOnlyDeviceFunc      func(deviceName string) bool
-	GetProfileConfigFunc    func(deviceName, profile string, claimUID types.UID) (*apis.NetworkConfig, error)
-	ReleaseProfileConfigFunc func(deviceName, profile string, claimUID types.UID) error
+	GetProfileConfigFunc    func(deviceName string, claimUID types.UID, config *apis.NetworkConfig) (*apis.NetworkConfig, error)
+	ReleaseProfileConfigFunc func(deviceName string, claimUID types.UID, config *apis.NetworkConfig) error
 }
 
 func newFakeInventoryDB() *fakeInventoryDB {
@@ -94,16 +94,16 @@ func (m *fakeInventoryDB) RequestRescan() {
 	m.rescanCalls.Add(1)
 }
 
-func (m *fakeInventoryDB) GetProfileConfig(deviceName, profile string, claimUID types.UID) (*apis.NetworkConfig, error) {
+func (m *fakeInventoryDB) GetProfileConfig(deviceName string, claimUID types.UID, config *apis.NetworkConfig) (*apis.NetworkConfig, error) {
 	if m.GetProfileConfigFunc != nil {
-		return m.GetProfileConfigFunc(deviceName, profile, claimUID)
+		return m.GetProfileConfigFunc(deviceName, claimUID, config)
 	}
 	return nil, nil
 }
 
-func (m *fakeInventoryDB) ReleaseProfileConfig(deviceName, profile string, claimUID types.UID) error {
+func (m *fakeInventoryDB) ReleaseProfileConfig(deviceName string, claimUID types.UID, config *apis.NetworkConfig) error {
 	if m.ReleaseProfileConfigFunc != nil {
-		return m.ReleaseProfileConfigFunc(deviceName, profile, claimUID)
+		return m.ReleaseProfileConfigFunc(deviceName, claimUID, config)
 	}
 	return nil
 }

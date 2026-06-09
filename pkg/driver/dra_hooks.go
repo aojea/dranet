@@ -222,7 +222,7 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 		mergedConf := apis.MergeNetworkConfig(userConf, cloudConf)
 
 		if mergedConf.Profile != "" {
-			profileConf, err := np.netdb.GetProfileConfig(result.Device, mergedConf.Profile, claim.UID)
+			profileConf, err := np.netdb.GetProfileConfig(result.Device, claim.UID, mergedConf)
 			if err != nil {
 				errorList = append(errorList, fmt.Errorf("failed to get profile config: %v", err))
 				continue
@@ -248,7 +248,7 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 			if err := np.podConfigStore.SetDeviceConfig(podUID, result.Device, deviceCfg); err != nil {
 				errorList = append(errorList, fmt.Errorf("failed to persist early device config for pod %s device %s: %v", podUID, result.Device, err))
 				// If we can't store it, we MUST release it immediately to prevent a leak.
-				if relErr := np.netdb.ReleaseProfileConfig(result.Device, netconf.Profile, claim.UID); relErr != nil {
+				if relErr := np.netdb.ReleaseProfileConfig(result.Device, claim.UID, &netconf); relErr != nil {
 					klog.Errorf("failed to rollback profile config for claim %v device %v: %v", claim.UID, result.Device, relErr)
 				}
 				continue
@@ -511,7 +511,7 @@ func (np *NetworkDriver) unprepareResourceClaim(_ context.Context, claim kubelet
 		for deviceName, devCfg := range podCfg.DeviceConfigs {
 			if devCfg.Claim.Namespace == claim.Namespace && devCfg.Claim.Name == claim.Name {
 				if devCfg.NetworkInterfaceConfigInPod.Profile != "" {
-					if err := np.netdb.ReleaseProfileConfig(deviceName, devCfg.NetworkInterfaceConfigInPod.Profile, claim.UID); err != nil {
+					if err := np.netdb.ReleaseProfileConfig(deviceName, claim.UID, &devCfg.NetworkInterfaceConfigInPod); err != nil {
 						klog.Errorf("failed to release profile config for claim %v: %v", claim.NamespacedName, err)
 					}
 				}

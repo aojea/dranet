@@ -591,7 +591,7 @@ func (db *DB) getProfileProvider() cloudprovider.ProfileProvider {
 }
 
 // GetProfileConfig resolves a dynamic profile by querying the underlying cloud provider.
-func (db *DB) GetProfileConfig(deviceName, profile string, claimUID types.UID) (*apis.NetworkConfig, error) {
+func (db *DB) GetProfileConfig(deviceName string, claimUID types.UID, config *apis.NetworkConfig) (*apis.NetworkConfig, error) {
 	p := db.getProfileProvider()
 	if p == nil {
 		return nil, fmt.Errorf("current cloud provider does not support dynamic profiles")
@@ -613,11 +613,11 @@ func (db *DB) GetProfileConfig(deviceName, profile string, claimUID types.UID) (
 		id.PCIAddress = *pciAttr.StringValue
 	}
 
-	return p.GetProfileConfig(id, profile, claimUID)
+	return p.GetProfileConfig(id, claimUID, config)
 }
 
 // ReleaseProfileConfig delegates the teardown of a dynamic profile to the cloud provider.
-func (db *DB) ReleaseProfileConfig(deviceName, profile string, claimUID types.UID) error {
+func (db *DB) ReleaseProfileConfig(deviceName string, claimUID types.UID, config *apis.NetworkConfig) error {
 	p := db.getProfileProvider()
 	if p == nil {
 		return nil // Provider doesn't support profiles, nothing to release
@@ -639,7 +639,7 @@ func (db *DB) ReleaseProfileConfig(deviceName, profile string, claimUID types.UI
 		}
 	}
 
-	return p.ReleaseProfileConfig(id, profile, claimUID)
+	return p.ReleaseProfileConfig(id, claimUID, config)
 }
 
 // GetDeviceConfig returns the network configuration associated with the device, if any.

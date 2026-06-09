@@ -66,8 +66,8 @@ type inventoryDB interface {
 	GetRDMADeviceName(deviceName string) (string, error)
 	GetDeviceConfig(deviceName string) (*apis.NetworkConfig, bool)
 	RequestRescan()
-	GetProfileConfig(deviceName, profile string, claimUID types.UID) (*apis.NetworkConfig, error)
-	ReleaseProfileConfig(deviceName, profile string, claimUID types.UID) error
+	GetProfileConfig(deviceName string, claimUID types.UID, config *apis.NetworkConfig) (*apis.NetworkConfig, error)
+	ReleaseProfileConfig(deviceName string, claimUID types.UID, config *apis.NetworkConfig) error
 }
 
 // WithFilter

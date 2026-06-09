@@ -319,7 +319,7 @@ func TestDynamicProfiles(t *testing.T) {
 
 	t.Run("Success Case", func(t *testing.T) {
 		fakeDB := newFakeInventoryDB()
-		fakeDB.GetProfileConfigFunc = func(deviceName, profile string, claimUID types.UID) (*apis.NetworkConfig, error) {
+		fakeDB.GetProfileConfigFunc = func(deviceName string, claimUID types.UID, config *apis.NetworkConfig) (*apis.NetworkConfig, error) {
 			return &apis.NetworkConfig{
 				Interface: apis.InterfaceConfig{
 					Addresses: []string{"10.0.0.1/24"},
@@ -382,7 +382,7 @@ func TestDynamicProfiles(t *testing.T) {
 
 	t.Run("Unsupported Provider Case", func(t *testing.T) {
 		fakeDB := newFakeInventoryDB()
-		fakeDB.GetProfileConfigFunc = func(deviceName, profile string, claimUID types.UID) (*apis.NetworkConfig, error) {
+		fakeDB.GetProfileConfigFunc = func(deviceName string, claimUID types.UID, config *apis.NetworkConfig) (*apis.NetworkConfig, error) {
 			return nil, fmt.Errorf("current cloud provider does not support dynamic profiles")
 		}
 		fakeDB.GetDeviceConfigFunc = func(deviceName string) (*apis.NetworkConfig, bool) {
@@ -431,7 +431,7 @@ func TestDynamicProfiles(t *testing.T) {
 
 	t.Run("Allocation Failure Case", func(t *testing.T) {
 		fakeDB := newFakeInventoryDB()
-		fakeDB.GetProfileConfigFunc = func(deviceName, profile string, claimUID types.UID) (*apis.NetworkConfig, error) {
+		fakeDB.GetProfileConfigFunc = func(deviceName string, claimUID types.UID, config *apis.NetworkConfig) (*apis.NetworkConfig, error) {
 			return nil, fmt.Errorf("ipam allocation failed")
 		}
 		fakeDB.GetDeviceConfigFunc = func(deviceName string) (*apis.NetworkConfig, bool) {
@@ -481,10 +481,10 @@ func TestDynamicProfiles(t *testing.T) {
 	t.Run("Teardown Success Case", func(t *testing.T) {
 		released := false
 		fakeDB := newFakeInventoryDB()
-		fakeDB.ReleaseProfileConfigFunc = func(deviceName, profile string, claimUID types.UID) error {
+		fakeDB.ReleaseProfileConfigFunc = func(deviceName string, claimUID types.UID, config *apis.NetworkConfig) error {
 			released = true
-			if profile != "my-profile" {
-				t.Errorf("Expected profile 'my-profile', got %v", profile)
+			if config.Profile != "my-profile" {
+				t.Errorf("Expected profile 'my-profile', got %v", config.Profile)
 			}
 			if claimUID != "claim-uid-td" {
 				t.Errorf("Expected claimUID 'claim-uid-td', got %v", claimUID)
@@ -521,7 +521,7 @@ func TestDynamicProfiles(t *testing.T) {
 
 	t.Run("Early Store Profile Release on Subsequent Failure", func(t *testing.T) {
 		fakeDB := newFakeInventoryDB()
-		fakeDB.GetProfileConfigFunc = func(deviceName, profile string, claimUID types.UID) (*apis.NetworkConfig, error) {
+		fakeDB.GetProfileConfigFunc = func(deviceName string, claimUID types.UID, config *apis.NetworkConfig) (*apis.NetworkConfig, error) {
 			return &apis.NetworkConfig{
 				Interface: apis.InterfaceConfig{
 					Addresses: []string{"10.0.0.1/24"},

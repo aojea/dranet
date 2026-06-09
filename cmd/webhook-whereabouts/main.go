@@ -62,9 +62,14 @@ func (s *Server) GetProfileConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conf, exists := s.profiles[req.Profile]
+	var profileName string
+	if req.Config != nil {
+		profileName = req.Config.Profile
+	}
+
+	conf, exists := s.profiles[profileName]
 	if !exists {
-		http.Error(w, fmt.Sprintf("CNI profile %q not found", req.Profile), http.StatusNotFound)
+		http.Error(w, fmt.Sprintf("CNI profile %q not found", profileName), http.StatusNotFound)
 		return
 	}
 
@@ -124,7 +129,12 @@ func (s *Server) ReleaseProfileConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conf, exists := s.profiles[req.Profile]
+	var profileName string
+	if req.Config != nil {
+		profileName = req.Config.Profile
+	}
+
+	conf, exists := s.profiles[profileName]
 	if !exists {
 		w.WriteHeader(http.StatusOK)
 		return

@@ -53,7 +53,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
             
             # User intent profile sets the address for python-profile
             resp = {}
-            profile_name = req_json.get("profile")
+            config_obj = req_json.get("config", {})
+            profile_name = config_obj.get("profile")
             if profile_name == "python-profile":
                 resp = {
                     "interface": {
