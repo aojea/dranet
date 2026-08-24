@@ -224,6 +224,27 @@ wait_for_ready_pods() {
   assert_output --partial "169.254.169.1"
 }
 
+@test "dummy interface with ipvlan ResourceClaim and address" {
+  docker exec "$CLUSTER_NAME"-worker bash -c "ip link add dummy0 type dummy"
+  docker exec "$CLUSTER_NAME"-worker bash -c "ip link set up dev dummy0"
+
+  kubectl apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/deviceclass.yaml
+  kubectl apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/resourceclaim_ipvlan.yaml
+  wait_for_ready_pods app=pod-ipvlan 30s
+
+  run kubectl exec pod-ipvlan -- ip -d link show dummy0
+  assert_success
+  assert_output --partial "ipvlan"
+
+  run kubectl exec pod-ipvlan -- ip addr show dummy0
+  assert_success
+  assert_output --partial "169.254.200.10"
+
+  # The parent interface still exists on the host.
+  run docker exec "$CLUSTER_NAME"-worker ip link show dummy0
+  assert_success
+}
+
 @test "test metric server is up and operating on host" {
   # Run a temporary pod to access metrics
   kubectl run test-metrics \
@@ -237,7 +258,6 @@ wait_for_ready_pods() {
   kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/test-metrics --timeout=5s
   assert_equal "$(kubectl logs test-metrics)" "ok"
 }
-
 
 @test "validate advanced network configurations with dummy" {
   docker exec "$CLUSTER_NAME"-worker bash -c "ip link add dummy0 type dummy"
