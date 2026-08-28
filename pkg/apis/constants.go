@@ -30,8 +30,16 @@ const (
 	RdmaNetnsModeShared    = "shared"
 	RdmaNetnsModeExclusive = "exclusive"
 
-	// RouteTableOffset is the offset used for DRANET-managed routing tables
-	// (VRF and source-based routing) to avoid ID collisions with reserved
-	// tables (0, 253, 254, 255) and to identify DRANET managed tables.
+	// RouteTableOffset is the offset used for DRANET-managed VRF tables, both
+	// user-requested (InterfaceConfig.VRF) and auto-derived for subinterfaces,
+	// to avoid ID collisions with reserved tables (0, 253, 254, 255) and to
+	// identify DRANET managed tables.
 	RouteTableOffset = 1000
+
+	// SubinterfaceVRFNamePrefix names the VRF DraNet auto-generates to give a
+	// subinterface its own routing domain when the user does not request one
+	// explicitly (see driver.newSubinterfaceVRF). It is reserved: a user-supplied
+	// VRFConfig.Name may not use it, so DraNet can always tell an auto-derived
+	// VRF apart from one the user asked to share across interfaces.
+	SubinterfaceVRFNamePrefix = "dranet-vrf"
 )

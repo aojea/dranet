@@ -194,6 +194,21 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 		}
 	}
 
+	// usedVRFTables tracks the VRF tables already in use by any device of this
+	// pod, so a subinterface's auto-derived VRF (see newSubinterfaceVRF) never
+	// collides with one from another device in the same netns, whether that
+	// device's VRF was itself auto-derived or requested by the user. Two
+	// user-requested VRFs are still allowed to share a table: that means the
+	// user is intentionally grouping interfaces into one routing domain.
+	usedVRFTables := make(map[int]bool)
+	if podCfg, ok := np.podConfigStore.GetPodConfig(podUID); ok {
+		for _, dc := range podCfg.DeviceConfigs {
+			if vrf := dc.NetworkInterfaceConfigInPod.Interface.VRF; vrf != nil && vrf.Table != nil {
+				usedVRFTables[*vrf.Table] = true
+			}
+		}
+	}
+
 	var errorList []error
 	for _, result := range claim.Status.Allocation.Devices.Results {
 		// A single ResourceClaim can have devices managed by distinct DRA
@@ -253,6 +268,11 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 			},
 			NetworkInterfaceConfigInPod: netconf,
 			DeviceSnapshot:              deviceSnapshot,
+		}
+		// Reserve this device's VRF table, if any, before any later device in the
+		// same pod auto-derives one (see usedVRFTables above).
+		if vrf := deviceCfg.NetworkInterfaceConfigInPod.Interface.VRF; vrf != nil && vrf.Table != nil {
+			usedVRFTables[*vrf.Table] = true
 		}
 
 		// Store early to guarantee profile cleanup on subsequent failures within this loop.
@@ -452,8 +472,15 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 			case len(deviceCfg.NetworkInterfaceConfigInPod.Routes) > 0 || len(deviceCfg.NetworkInterfaceConfigInPod.Rules) > 0:
 				// User-provided routes/rules exist; skip automatic source-based routing.
 			case len(iface.Addresses) > 0:
-				// Derive the gateway from the parent's routes to build source-based
-				// routing, without copying those routes/rules into the pod config.
+				// Auto-enslave the subinterface into its own VRF, unless the user
+				// already requested one, so egress for its addresses uses this
+				// interface's gateway instead of the pod's main routing table.
+				if iface.VRF == nil {
+					iface.VRF = newSubinterfaceVRF(iface.Name, usedVRFTables)
+					usedVRFTables[*iface.VRF.Table] = true
+				}
+				// Derive the gateway from the parent's routes to build the VRF's
+				// default route, without copying those routes/rules into the pod config.
 				parentRoutes, _, err := getRouteInfo(nlHandle, ifName, link)
 				if err != nil {
 					errorList = append(errorList, err)
@@ -785,14 +812,42 @@ func mergeDeviceStructs(live, snap resourceapi.Device) resourceapi.Device {
 	return merged
 }
 
-// addSourceBasedRouting sets up source-based routing for the subinterface: each
-// source address egresses via a per-interface table holding an on-link gateway route
-// and a default route. The gateway for each IP family is derived from parentRoutes.
-func addSourceBasedRouting(deviceCfg *DeviceConfig, parentRoutes []apis.RouteConfig) {
+// newSubinterfaceVRF returns a VRF to auto-enslave a subinterface into,
+// derived from its pod-facing interface name. used holds the VRF tables
+// already claimed by other devices of the same pod; the hash-derived table is
+// probed forward within DraNet's reserved range until a free one is found, so
+// two subinterfaces (or a subinterface and a user-requested VRF) in the same
+// pod can never end up sharing a table by accident. Reusing the VRF mechanism
+// means enslavement, sysctls and table-routing are handled entirely by
+// applyVRFConfig/applyRoutingConfig; no bespoke routing table or policy rule
+// is needed here.
+func newSubinterfaceVRF(ifName string, used map[int]bool) *apis.VRFConfig {
+	const tableRangeSize = 1000 // matches the '% 1000' space apis.RouteTableOffset reserves.
 	h := fnv.New32a()
-	h.Write([]byte(deviceCfg.NetworkInterfaceConfigInPod.Interface.Name))
-	tableID := int((h.Sum32() % 1000) + apis.RouteTableOffset)
+	h.Write([]byte(ifName))
+	base := int(h.Sum32() % tableRangeSize)
 
+	tableID := base + apis.RouteTableOffset
+	for i := 0; i < tableRangeSize; i++ {
+		candidate := (base+i)%tableRangeSize + apis.RouteTableOffset
+		if !used[candidate] {
+			tableID = candidate
+			break
+		}
+	}
+	return &apis.VRFConfig{
+		Name:  fmt.Sprintf("%s%d", apis.SubinterfaceVRFNamePrefix, tableID),
+		Table: &tableID,
+	}
+}
+
+// addSourceBasedRouting adds an on-link gateway route and a default route for
+// the subinterface's addresses, derived from parentRoutes. The interface is
+// expected to already be assigned to its own VRF (see newSubinterfaceVRF), so
+// these routes are added with no explicit Table: applyRoutingConfig places
+// them in the VRF's table, and the VRF's l3mdev binding handles the lookup
+// without requiring a policy routing rule.
+func addSourceBasedRouting(deviceCfg *DeviceConfig, parentRoutes []apis.RouteConfig) {
 	// Find the gateway for each IP family from the parent routes.
 	// gateways stores the gateway IP addresses, keyed by "ipv4" and "ipv6".
 	gateways := make(map[string]netip.Addr)
@@ -812,9 +867,9 @@ func addSourceBasedRouting(deviceCfg *DeviceConfig, parentRoutes []apis.RouteCon
 		return
 	}
 
-	// Iterate through IP addresses to inject the gateway and default routes into the
-	// custom table, and add a source-based routing rule for each IP targeting the custom table.
-	// addedRoutes records whether the gateway and default routes are added for "ipv4" and "ipv6".
+	// Iterate through IP addresses to inject the gateway and default route for
+	// each IP family present. addedRoutes records whether they were already
+	// added for "ipv4" and "ipv6".
 	addedRoutes := make(map[string]bool)
 	for _, ipStr := range deviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses {
 		prefix, _ := netip.ParsePrefix(ipStr)
@@ -831,31 +886,21 @@ func addSourceBasedRouting(deviceCfg *DeviceConfig, parentRoutes []apis.RouteCon
 			continue
 		}
 		gwAddr, hasGw := gateways[stack]
-		if !hasGw {
+		if !hasGw || addedRoutes[stack] {
 			continue
 		}
 
-		if !addedRoutes[stack] {
-			// Add link route for the gateway.
-			gwPrefix := netip.PrefixFrom(gwAddr, gwAddr.BitLen())
-			deviceCfg.NetworkInterfaceConfigInPod.Routes = append(deviceCfg.NetworkInterfaceConfigInPod.Routes, apis.RouteConfig{
-				Destination: gwPrefix.String(),
-				Scope:       unix.RT_SCOPE_LINK,
-				Table:       tableID,
-			})
-			// Add default route in the custom table.
-			deviceCfg.NetworkInterfaceConfigInPod.Routes = append(deviceCfg.NetworkInterfaceConfigInPod.Routes, apis.RouteConfig{
-				Destination: defaultPrefix.String(),
-				Gateway:     gwAddr.String(),
-				Table:       tableID,
-			})
-			addedRoutes[stack] = true
-		}
-		// Add source-based routing rule for the current IP address.
-		deviceCfg.NetworkInterfaceConfigInPod.Rules = append(deviceCfg.NetworkInterfaceConfigInPod.Rules, apis.RuleConfig{
-			Source:   ipStr,
-			Table:    tableID,
-			Priority: 32000,
+		// Add link route for the gateway.
+		gwPrefix := netip.PrefixFrom(gwAddr, gwAddr.BitLen())
+		deviceCfg.NetworkInterfaceConfigInPod.Routes = append(deviceCfg.NetworkInterfaceConfigInPod.Routes, apis.RouteConfig{
+			Destination: gwPrefix.String(),
+			Scope:       unix.RT_SCOPE_LINK,
 		})
+		// Add default route, to be placed in the VRF's table by applyRoutingConfig.
+		deviceCfg.NetworkInterfaceConfigInPod.Routes = append(deviceCfg.NetworkInterfaceConfigInPod.Routes, apis.RouteConfig{
+			Destination: defaultPrefix.String(),
+			Gateway:     gwAddr.String(),
+		})
+		addedRoutes[stack] = true
 	}
 }

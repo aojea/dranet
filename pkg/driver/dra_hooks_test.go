@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1299,6 +1300,94 @@ func testPrepareResourceClaim_Namespaced(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "subinterface with resolved addresses is auto-enslaved into its own VRF",
+			claim: &resourcev1.ResourceClaim{
+				ObjectMeta: metav1.ObjectMeta{UID: "claim-uid-subif-vrf", Namespace: "default", Name: "claim-subif-vrf"},
+				Status: resourcev1.ResourceClaimStatus{
+					ReservedFor: []resourcev1.ResourceClaimConsumerReference{
+						{APIGroup: "", Resource: "pods", Name: "test-pod", UID: "pod-uid-subif-vrf"},
+					},
+					Allocation: &resourcev1.AllocationResult{
+						Devices: resourcev1.DeviceAllocationResult{
+							Results: []resourcev1.DeviceRequestAllocationResult{
+								{Driver: testDriverName, Device: "net-dev-0", Request: "req-0"},
+							},
+						},
+					},
+				},
+			},
+			setupDB: func(db *fakeInventoryDB) {
+				// Dedicated parent link (not the shared dummy0) with an address and
+				// a default route, so getRouteInfo can resolve a real gateway.
+				la := netlink.NewLinkAttrs()
+				la.Name = "dummy-vrf0"
+				parent := &netlink.Dummy{LinkAttrs: la}
+				if err := netlink.LinkAdd(parent); err != nil {
+					t.Fatalf("failed to create parent interface: %v", err)
+				}
+				parentLink, err := netlink.LinkByName("dummy-vrf0")
+				if err != nil {
+					t.Fatalf("failed to find parent interface: %v", err)
+				}
+				if err := netlink.LinkSetUp(parentLink); err != nil {
+					t.Fatalf("failed to set parent interface up: %v", err)
+				}
+				addr, err := netlink.ParseAddr("10.50.0.2/24")
+				if err != nil {
+					t.Fatalf("failed to parse address: %v", err)
+				}
+				if err := netlink.AddrAdd(parentLink, addr); err != nil {
+					t.Fatalf("failed to add address to parent interface: %v", err)
+				}
+				defaultRoute := &netlink.Route{
+					LinkIndex: parentLink.Attrs().Index,
+					Dst:       nil,
+					Gw:        net.ParseIP("10.50.0.1"),
+				}
+				if err := netlink.RouteAdd(defaultRoute); err != nil {
+					t.Fatalf("failed to add default route to parent interface: %v", err)
+				}
+
+				db.IsIBOnlyDeviceFunc = func(deviceName string) bool { return false }
+				db.GetNetInterfaceNameFunc = func(deviceName string) (string, error) { return "dummy-vrf0", nil }
+				db.GetDeviceFunc = func(deviceName string) (resourcev1.Device, bool) {
+					return resourcev1.Device{Name: deviceName}, true
+				}
+				// Cloud resolves a static address for the ipvlan subinterface.
+				db.GetDeviceConfigFunc = func(deviceName string) (*apis.NetworkConfig, bool) {
+					return &apis.NetworkConfig{Interface: apis.InterfaceConfig{Type: "IPVLAN", Addresses: []string{"10.50.0.100/32"}}}, true
+				}
+			},
+			wantPodConfig: &PodConfig{
+				DeviceConfigs: map[string]DeviceConfig{
+					"net-dev-0": {
+						Claim: types.NamespacedName{
+							Namespace: "default",
+							Name:      "claim-subif-vrf",
+						},
+						DeviceSnapshot: &resourcev1.Device{Name: "net-dev-0"},
+						NetworkInterfaceConfigInHost: apis.NetworkConfig{
+							Interface: apis.InterfaceConfig{
+								Name: "dummy-vrf0",
+							},
+						},
+						NetworkInterfaceConfigInPod: apis.NetworkConfig{
+							Interface: apis.InterfaceConfig{
+								Name:      "dummy-vrf0",
+								Type:      "IPVLAN",
+								Addresses: []string{"10.50.0.100/32"},
+								VRF:       newSubinterfaceVRF("dummy-vrf0", map[int]bool{}),
+							},
+							Routes: []apis.RouteConfig{
+								{Destination: "10.50.0.1/32", Scope: 253},
+								{Destination: "0.0.0.0/0", Gateway: "10.50.0.1"},
+							},
+						},
+					},
+				},
+			},
+		},
 	}
 
 	for _, tc := range testCases {
@@ -1343,15 +1432,11 @@ func testPrepareResourceClaim_Namespaced(t *testing.T) {
 
 func TestAddSourceBasedRoutingRule(t *testing.T) {
 	const ifName = "ipvlan0"
-	h := fnv.New32a()
-	h.Write([]byte(ifName))
-	wantTable := int((h.Sum32() % 1000) + apis.RouteTableOffset)
 
 	tests := []struct {
 		name         string
 		deviceCfg    DeviceConfig
 		parentRoutes []apis.RouteConfig
-		wantRules    []apis.RuleConfig
 		wantRoutes   []apis.RouteConfig
 	}{
 		{
@@ -1368,7 +1453,6 @@ func TestAddSourceBasedRoutingRule(t *testing.T) {
 			parentRoutes: []apis.RouteConfig{
 				{Destination: "192.168.1.0/24", Table: 0},
 			},
-			wantRules:  nil,
 			wantRoutes: nil,
 		},
 		{
@@ -1385,16 +1469,13 @@ func TestAddSourceBasedRoutingRule(t *testing.T) {
 			parentRoutes: []apis.RouteConfig{
 				{Destination: "::/0", Gateway: "fe80::1", Table: 0},
 			},
-			wantRules: []apis.RuleConfig{
-				{Source: "2001:db8::3/128", Table: wantTable, Priority: 32000},
-			},
 			wantRoutes: []apis.RouteConfig{
-				{Destination: "fe80::1/128", Table: wantTable, Scope: 253},
-				{Destination: "::/0", Gateway: "fe80::1", Table: wantTable},
+				{Destination: "fe80::1/128", Scope: 253},
+				{Destination: "::/0", Gateway: "fe80::1"},
 			},
 		},
 		{
-			name: "dual-stack routes with gateways, both IPv4 and IPv6 routes and rules should be added",
+			name: "dual-stack routes with gateways, both IPv4 and IPv6 routes should be added",
 			deviceCfg: DeviceConfig{
 				NetworkInterfaceConfigInPod: apis.NetworkConfig{
 					Interface: apis.InterfaceConfig{
@@ -1408,19 +1489,15 @@ func TestAddSourceBasedRoutingRule(t *testing.T) {
 				{Destination: "192.168.1.0/24", Gateway: "192.168.1.1", Table: 100},
 				{Destination: "2001:db8::/64", Gateway: "fe80::1", Table: 0},
 			},
-			wantRules: []apis.RuleConfig{
-				{Source: "192.168.1.3/32", Table: wantTable, Priority: 32000},
-				{Source: "2001:db8::3/128", Table: wantTable, Priority: 32000},
-			},
 			wantRoutes: []apis.RouteConfig{
-				{Destination: "192.168.1.1/32", Table: wantTable, Scope: 253},
-				{Destination: "0.0.0.0/0", Gateway: "192.168.1.1", Table: wantTable},
-				{Destination: "fe80::1/128", Table: wantTable, Scope: 253},
-				{Destination: "::/0", Gateway: "fe80::1", Table: wantTable},
+				{Destination: "192.168.1.1/32", Scope: 253},
+				{Destination: "0.0.0.0/0", Gateway: "192.168.1.1"},
+				{Destination: "fe80::1/128", Scope: 253},
+				{Destination: "::/0", Gateway: "fe80::1"},
 			},
 		},
 		{
-			name: "multiple IPv6 addresses with the default route, two rules and one set of custom table routes should be added",
+			name: "multiple IPv6 addresses with the default route, one set of gateway/default routes should be added",
 			deviceCfg: DeviceConfig{
 				NetworkInterfaceConfigInPod: apis.NetworkConfig{
 					Interface: apis.InterfaceConfig{
@@ -1433,13 +1510,9 @@ func TestAddSourceBasedRoutingRule(t *testing.T) {
 			parentRoutes: []apis.RouteConfig{
 				{Destination: "::/0", Gateway: "fe80::1", Table: 0},
 			},
-			wantRules: []apis.RuleConfig{
-				{Source: "2001:db8::3/128", Table: wantTable, Priority: 32000},
-				{Source: "2001:db8::4/128", Table: wantTable, Priority: 32000},
-			},
 			wantRoutes: []apis.RouteConfig{
-				{Destination: "fe80::1/128", Table: wantTable, Scope: 253},
-				{Destination: "::/0", Gateway: "fe80::1", Table: wantTable},
+				{Destination: "fe80::1/128", Scope: 253},
+				{Destination: "::/0", Gateway: "fe80::1"},
 			},
 		},
 		{
@@ -1456,7 +1529,6 @@ func TestAddSourceBasedRoutingRule(t *testing.T) {
 			parentRoutes: []apis.RouteConfig{
 				{Destination: "0.0.0.0/0", Gateway: "192.168.1.1", Table: 0}, // only an IPv4 gateway
 			},
-			wantRules:  nil,
 			wantRoutes: nil,
 		},
 	}
@@ -1464,14 +1536,11 @@ func TestAddSourceBasedRoutingRule(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			addSourceBasedRouting(&tt.deviceCfg, tt.parentRoutes)
-			gotRules := tt.deviceCfg.NetworkInterfaceConfigInPod.Rules
-			if len(gotRules) != len(tt.wantRules) {
-				t.Fatalf("Expected %d rules, got %d", len(tt.wantRules), len(gotRules))
-			}
-			for i := range gotRules {
-				if gotRules[i].Source != tt.wantRules[i].Source || gotRules[i].Table != tt.wantRules[i].Table || gotRules[i].Priority != tt.wantRules[i].Priority {
-					t.Errorf("gotRules[%d] = %+v, want %+v", i, gotRules[i], tt.wantRules[i])
-				}
+
+			// No policy routing rule is added: the routes above are expected
+			// to land in the subinterface's VRF table via applyRoutingConfig.
+			if gotRules := tt.deviceCfg.NetworkInterfaceConfigInPod.Rules; len(gotRules) != 0 {
+				t.Errorf("expected no rules, got %+v", gotRules)
 			}
 
 			gotRoutes := tt.deviceCfg.NetworkInterfaceConfigInPod.Routes
@@ -1479,10 +1548,49 @@ func TestAddSourceBasedRoutingRule(t *testing.T) {
 				t.Fatalf("Expected %d routes, got %d", len(tt.wantRoutes), len(gotRoutes))
 			}
 			for i := range gotRoutes {
-				if gotRoutes[i].Destination != tt.wantRoutes[i].Destination || gotRoutes[i].Gateway != tt.wantRoutes[i].Gateway || gotRoutes[i].Table != tt.wantRoutes[i].Table || gotRoutes[i].Scope != tt.wantRoutes[i].Scope {
+				// Table is intentionally left unset here; it is filled in later
+				// from the interface's VRF, not by addSourceBasedRouting.
+				if gotRoutes[i].Table != 0 {
+					t.Errorf("gotRoutes[%d].Table = %d, want 0 (unset)", i, gotRoutes[i].Table)
+				}
+				if gotRoutes[i].Destination != tt.wantRoutes[i].Destination || gotRoutes[i].Gateway != tt.wantRoutes[i].Gateway || gotRoutes[i].Scope != tt.wantRoutes[i].Scope {
 					t.Errorf("gotRoutes[%d] = %+v, want %+v", i, gotRoutes[i], tt.wantRoutes[i])
 				}
 			}
 		})
+	}
+}
+
+func TestNewSubinterfaceVRF(t *testing.T) {
+	h := fnv.New32a()
+	h.Write([]byte("ipvlan0"))
+	wantTable := int((h.Sum32() % 1000) + apis.RouteTableOffset)
+
+	vrf := newSubinterfaceVRF("ipvlan0", map[int]bool{})
+	if vrf.Name != fmt.Sprintf("%s%d", apis.SubinterfaceVRFNamePrefix, wantTable) {
+		t.Errorf("Name = %q, want %q", vrf.Name, fmt.Sprintf("%s%d", apis.SubinterfaceVRFNamePrefix, wantTable))
+	}
+	if vrf.Table == nil || *vrf.Table != wantTable {
+		t.Errorf("Table = %v, want %d", vrf.Table, wantTable)
+	}
+	if len(vrf.Name) > apis.MaxInterfaceNameLen {
+		t.Errorf("Name %q exceeds MaxInterfaceNameLen (%d)", vrf.Name, apis.MaxInterfaceNameLen)
+	}
+
+	// Deterministic: same interface name and used set must always produce the same VRF.
+	again := newSubinterfaceVRF("ipvlan0", map[int]bool{})
+	if again.Name != vrf.Name || *again.Table != *vrf.Table {
+		t.Errorf("newSubinterfaceVRF is not deterministic: got %+v and %+v", vrf, again)
+	}
+
+	// A table already in use by another device of the pod (whether that
+	// device's VRF was auto-derived or user-requested) must never be reused.
+	used := map[int]bool{wantTable: true}
+	probed := newSubinterfaceVRF("ipvlan0", used)
+	if *probed.Table == wantTable {
+		t.Errorf("newSubinterfaceVRF collided with an already-used table %d", wantTable)
+	}
+	if used[*probed.Table] {
+		t.Errorf("newSubinterfaceVRF returned table %d which was already used", *probed.Table)
 	}
 }

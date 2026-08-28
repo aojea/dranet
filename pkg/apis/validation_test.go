@@ -131,6 +131,13 @@ func TestValidateConfig(t *testing.T) {
 			expectedCfg: &NetworkConfig{Interface: InterfaceConfig{Name: "eth0", VRF: &VRFConfig{Name: "my-vrf"}}, Rules: []RuleConfig{{Table: 100}}},
 			errContains: []string{"rules are not supported when VRF is enabled"},
 		},
+		{
+			name:        "config with VRF name using the reserved subinterface prefix",
+			raw:         newRawExtension(t, NetworkConfig{Interface: InterfaceConfig{Name: "eth0", VRF: &VRFConfig{Name: SubinterfaceVRFNamePrefix + "42"}}}),
+			expectErr:   true,
+			expectedCfg: &NetworkConfig{Interface: InterfaceConfig{Name: "eth0", VRF: &VRFConfig{Name: SubinterfaceVRFNamePrefix + "42"}}},
+			errContains: []string{"prefix is reserved for DraNet-managed VRFs"},
+		},
 	}
 
 	for _, tt := range tests {

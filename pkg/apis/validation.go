@@ -234,6 +234,12 @@ func validateVRFConfig(cfg *VRFConfig, fieldPath string) (allErrors []error) {
 		allErrors = append(allErrors, fmt.Errorf("%s.name: cannot be empty", fieldPath))
 	}
 
+	// Reserved for the VRF DraNet auto-generates for subinterfaces; a user-supplied
+	// name here would be indistinguishable from one DraNet created itself.
+	if strings.HasPrefix(cfg.Name, SubinterfaceVRFNamePrefix) {
+		allErrors = append(allErrors, fmt.Errorf("%s.name: %q prefix is reserved for DraNet-managed VRFs", fieldPath, SubinterfaceVRFNamePrefix))
+	}
+
 	if cfg.Table != nil {
 		if *cfg.Table <= 0 {
 			allErrors = append(allErrors, fmt.Errorf("%s.table: must be a positive integer, got %d", fieldPath, *cfg.Table))
