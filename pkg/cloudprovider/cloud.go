@@ -53,12 +53,3 @@ type ProfileProvider interface {
 	// previously allocated for the given claim and profile.
 	ReleaseProfileConfig(id DeviceIdentifiers, claimUID types.UID, config *apis.NetworkConfig) error
 }
-
-// InstanceOptions carries optional construction-time inputs for cloud providers.
-// Each provider consumes only the fields relevant to it.
-type InstanceOptions struct {
-	// ReservedAddresses contains IP addresses currently active on the node.
-	// If a cloud provider manages node-local IPAM, these addresses can be used to
-	// initialize its reservation state and avoid assigning addresses already in use.
-	ReservedAddresses []string
-}

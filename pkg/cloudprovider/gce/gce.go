@@ -226,7 +226,7 @@ func (g *GCEInstance) ReleaseProfileConfig(id cloudprovider.DeviceIdentifiers, c
 }
 
 // GetInstance retrieves GCE instance properties by querying the metadata server.
-func GetInstance(ctx context.Context, opts cloudprovider.InstanceOptions) (cloudprovider.CloudInstance, error) {
+func GetInstance(ctx context.Context, opts ...Option) (cloudprovider.CloudInstance, error) {
 	var instance *GCEInstance
 	// metadata server can not be available during startup
 	err := wait.PollUntilContextTimeout(ctx, 1*time.Second, 15*time.Second, true, func(ctx context.Context) (done bool, err error) {
@@ -258,7 +258,10 @@ func GetInstance(ctx context.Context, opts cloudprovider.InstanceOptions) (cloud
 			Name:                instanceName,
 			Type:                instanceType,
 			AcceleratorProtocol: string(protocol),
-			localIPAM:           ipam.NewLocalIPAM(opts.ReservedAddresses),
+			localIPAM:           ipam.NewLocalIPAM(nil),
+		}
+		for _, opt := range opts {
+			opt(instance)
 		}
 		if err = json.Unmarshal([]byte(gceInterfacesRaw), &instance.Interfaces); err != nil {
 			klog.Infof("could not get network interfaces on GCE ... retrying: %v", err)
@@ -280,6 +283,17 @@ func GetInstance(ctx context.Context, opts cloudprovider.InstanceOptions) (cloud
 		return nil, err
 	}
 	return instance, nil
+}
+
+// Option configures a GCEInstance at construction time; see GetInstance.
+type Option func(*GCEInstance)
+
+// WithReservedAddresses seeds the instance's node-local IPAM with addresses
+// already in use on the node, so it doesn't hand out ones that are taken.
+func WithReservedAddresses(addrs []string) Option {
+	return func(g *GCEInstance) {
+		g.localIPAM = ipam.NewLocalIPAM(addrs)
+	}
 }
 
 // subinterfaceRanges derives the node-local IP allocation ranges for the given GCE network interface.

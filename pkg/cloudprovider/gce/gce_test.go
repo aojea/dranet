@@ -373,3 +373,15 @@ func TestSubinterfaceRanges(t *testing.T) {
 		})
 	}
 }
+
+func TestWithReservedAddresses(t *testing.T) {
+	g := &GCEInstance{localIPAM: ipam.NewLocalIPAM(nil)}
+	WithReservedAddresses([]string{"10.0.0.5/32"})(g)
+
+	if err := g.localIPAM.Reserve([]string{"10.0.0.5/32"}); err == nil {
+		t.Errorf("expected 10.0.0.5/32 to already be reserved, but it was accepted again")
+	}
+	if err := g.localIPAM.Reserve([]string{"10.0.0.6/32"}); err != nil {
+		t.Errorf("expected 10.0.0.6/32 to be free, got error: %v", err)
+	}
+}

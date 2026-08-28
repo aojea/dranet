@@ -35,7 +35,12 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/time/rate"
 	"sigs.k8s.io/dranet/pkg/cloudprovider"
+	"sigs.k8s.io/dranet/pkg/cloudprovider/alibaba"
+	"sigs.k8s.io/dranet/pkg/cloudprovider/aws"
+	"sigs.k8s.io/dranet/pkg/cloudprovider/azure"
 	"sigs.k8s.io/dranet/pkg/cloudprovider/discovery"
+	"sigs.k8s.io/dranet/pkg/cloudprovider/gce"
+	"sigs.k8s.io/dranet/pkg/cloudprovider/oke"
 	"sigs.k8s.io/dranet/pkg/cloudprovider/webhook"
 	"sigs.k8s.io/dranet/pkg/driver"
 	"sigs.k8s.io/dranet/pkg/features"
@@ -197,10 +202,7 @@ func main() {
 		opts = append(opts, driver.WithFilter(prg))
 	}
 	// Cloud provider construction options.
-	cloudOpts := cloudprovider.InstanceOptions{
-		ReservedAddresses: store.GetInUseSubinterfaceIPs(),
-	}
-	cloudInst, profProv, err := setupProviders(ctx, cloudProviderHint, profileProvider, webhookURL, cloudOpts)
+	cloudInst, profProv, err := setupProviders(ctx, cloudProviderHint, profileProvider, webhookURL, store.GetInUseSubinterfaceIPs())
 	if err != nil {
 		klog.Fatalf("failed to setup providers: %v", err)
 	}
@@ -254,7 +256,7 @@ func printVersion() {
 	klog.Infof("dranet go %s build: %s time: %s", info.GoVersion, vcsRevision, vcsTime)
 }
 
-func setupProviders(ctx context.Context, cloudProviderHint string, profileProvider string, webhookURL string, opts cloudprovider.InstanceOptions) (cloudprovider.CloudInstance, cloudprovider.ProfileProvider, error) {
+func setupProviders(ctx context.Context, cloudProviderHint string, profileProvider string, webhookURL string, reservedAddresses []string) (cloudprovider.CloudInstance, cloudprovider.ProfileProvider, error) {
 	var cloudInst cloudprovider.CloudInstance
 	var profProv cloudprovider.ProfileProvider
 	var err error
@@ -268,7 +270,37 @@ func setupProviders(ctx context.Context, cloudProviderHint string, profileProvid
 	}
 
 	// Setup the Underlay (Hardware Discovery / Cloud Instance Info)
-	cloudInst, err = discovery.GetInstanceProperties(ctx, hint, webhookURL, opts)
+	factories := map[discovery.CloudProviderHint]discovery.ProviderFactory{
+		discovery.CloudProviderHintGCE: func(ctx context.Context) (cloudprovider.CloudInstance, error) {
+			return gce.GetInstance(ctx, gce.WithReservedAddresses(reservedAddresses))
+		},
+		discovery.CloudProviderHintAWS: func(ctx context.Context) (cloudprovider.CloudInstance, error) {
+			return aws.GetInstance(ctx)
+		},
+		discovery.CloudProviderHintAzure: func(ctx context.Context) (cloudprovider.CloudInstance, error) {
+			return azure.GetInstance(ctx)
+		},
+		discovery.CloudProviderHintOKE: func(ctx context.Context) (cloudprovider.CloudInstance, error) {
+			return oke.GetInstance(ctx)
+		},
+		discovery.CloudProviderHintAlibaba: func(ctx context.Context) (cloudprovider.CloudInstance, error) {
+			return alibaba.GetInstance(ctx)
+		},
+		discovery.CloudProviderHintWebhook: func(ctx context.Context) (cloudprovider.CloudInstance, error) {
+			if webhookURL == "" {
+				return nil, fmt.Errorf("--webhook-url is required when using the webhook cloud provider")
+			}
+			p, err := webhook.NewWebhookProvider(ctx, webhookURL)
+			if err != nil {
+				return nil, err
+			}
+			if !p.HasCloudProvider() {
+				return nil, nil
+			}
+			return p, nil
+		},
+	}
+	cloudInst, err = discovery.GetInstanceProperties(ctx, hint, factories)
 	if err != nil {
 		klog.Infof("failed to initialize cloud provider %q: %v", hint, err)
 		cloudInst = nil

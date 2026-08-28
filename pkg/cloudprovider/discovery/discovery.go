@@ -25,7 +25,6 @@ import (
 	"sigs.k8s.io/dranet/pkg/cloudprovider/alibaba"
 	"sigs.k8s.io/dranet/pkg/cloudprovider/aws"
 	"sigs.k8s.io/dranet/pkg/cloudprovider/azure"
-	"sigs.k8s.io/dranet/pkg/cloudprovider/gce"
 	"sigs.k8s.io/dranet/pkg/cloudprovider/oke"
 	"sigs.k8s.io/dranet/pkg/cloudprovider/webhook"
 )
@@ -65,34 +64,23 @@ func DiscoverCloudProvider(ctx context.Context, webhookURL string) CloudProvider
 	return CloudProviderHintNone
 }
 
-// GetInstanceProperties initializes and returns the specified cloud provider instance.
-func GetInstanceProperties(ctx context.Context, hint CloudProviderHint, webhookURL string, opts cloudprovider.InstanceOptions) (cloudprovider.CloudInstance, error) {
-	switch hint {
-	case CloudProviderHintGCE:
-		return gce.GetInstance(ctx, opts)
-	case CloudProviderHintAWS:
-		return aws.GetInstance(ctx)
-	case CloudProviderHintAzure:
-		return azure.GetInstance(ctx)
-	case CloudProviderHintOKE:
-		return oke.GetInstance(ctx)
-	case CloudProviderHintAlibaba:
-		return alibaba.GetInstance(ctx)
-	case CloudProviderHintWebhook:
-		if webhookURL == "" {
-			return nil, fmt.Errorf("--webhook-url is required when using the webhook cloud provider")
-		}
-		p, err := webhook.NewWebhookProvider(ctx, webhookURL)
-		if err != nil {
-			return nil, err
-		}
-		if !p.HasCloudProvider() {
-			return nil, nil
-		}
-		return p, nil
-	case CloudProviderHintNone, "none", "":
+// ProviderFactory constructs a specific cloud provider's CloudInstance. Each
+// provider's factory closes over exactly the inputs that provider needs
+// (e.g. gce.WithReservedAddresses(...)); GetInstanceProperties itself never
+// holds or interprets any of them, so its signature never has to change as
+// providers' construction-time needs change.
+type ProviderFactory func(ctx context.Context) (cloudprovider.CloudInstance, error)
+
+// GetInstanceProperties looks up and invokes the factory registered for hint.
+// Callers build factories (see cmd/dranet/app.go) with one entry per
+// discoverable CloudProviderHint.
+func GetInstanceProperties(ctx context.Context, hint CloudProviderHint, factories map[CloudProviderHint]ProviderFactory) (cloudprovider.CloudInstance, error) {
+	if hint == CloudProviderHintNone || hint == "none" || hint == "" {
 		return nil, nil
-	default:
+	}
+	factory, ok := factories[hint]
+	if !ok {
 		return nil, fmt.Errorf("unknown cloud provider hint: %s", hint)
 	}
+	return factory(ctx)
 }

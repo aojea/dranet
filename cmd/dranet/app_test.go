@@ -23,7 +23,6 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"sigs.k8s.io/dranet/pkg/cloudprovider"
 	"sigs.k8s.io/dranet/pkg/cloudprovider/webhook"
 )
 
@@ -154,7 +153,7 @@ func TestSetupProviders(t *testing.T) {
 				endpoint = srv.URL
 			}
 
-			cloudInst, profProv, err := setupProviders(ctx, tt.cloudProviderHint, tt.profileProvider, endpoint, cloudprovider.InstanceOptions{})
+			cloudInst, profProv, err := setupProviders(ctx, tt.cloudProviderHint, tt.profileProvider, endpoint, nil)
 
 			if (err != nil) != tt.expectErr {
 				t.Errorf("expected error: %v, got: %v", tt.expectErr, err)
