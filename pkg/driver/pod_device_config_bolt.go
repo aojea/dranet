@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
@@ -30,6 +31,8 @@ import (
 
 // Bucket layout:
 //
+//	meta (root bucket)
+//	  └── schemaVersion = decimal string, see checkpointSchemaVersion
 //	pod_configs (root bucket)
 //	  └── <POD_UID> (nested bucket per pod)
 //	        └── device_configs (nested bucket for device configs)
@@ -37,7 +40,19 @@ import (
 var (
 	podConfigsBucket = []byte("pod_configs")
 	deviceConfigsKey = []byte("device_configs")
+	metaBucket       = []byte("meta")
+	schemaVersionKey = []byte("schemaVersion")
 )
+
+// checkpointSchemaVersion is the database schema version supported by this driver.
+// Existing databases without a meta bucket are treated as version 1.
+// Bump this version and add a migration when making breaking changes to the
+// bucket layout or DeviceConfig format.
+const checkpointSchemaVersion = 1
+
+// checkpointMigrations maps a version to the migration function that upgrades
+// the database to version+1.
+var checkpointMigrations = map[int]func(tx *bolt.Tx) error{}
 
 // boltCheckpointer implements Checkpointer backed by bbolt.
 type boltCheckpointer struct {
@@ -58,17 +73,57 @@ func newBoltCheckpointer(path string) (*boltCheckpointer, error) {
 		return nil, fmt.Errorf("open pod config db: %w", err)
 	}
 
-	// Ensure the root bucket exists.
+	// Ensure the root bucket exists and the layout is at the current schema version.
 	err = db.Update(func(tx *bolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists(podConfigsBucket)
-		return err
+		if _, err := tx.CreateBucketIfNotExists(podConfigsBucket); err != nil {
+			return err
+		}
+		return migrateSchema(tx, checkpointSchemaVersion, checkpointMigrations)
 	})
 	if err != nil {
 		db.Close()
-		return nil, fmt.Errorf("initialize pod config db bucket: %w", err)
+		return nil, fmt.Errorf("initialize pod config db: %w", err)
 	}
 
 	return &boltCheckpointer{db: db}, nil
+}
+
+// migrateSchema upgrades the database schema sequentially to target (for example,
+// v1 -> v2 -> v3 -> v4).
+//
+// All migrations and the schema version update run in a single transaction. If any
+// migration step fails (for example, 3 -> 4), the entire transaction rolls back to
+// the starting version (v1). This ensures the database is never left in an
+// intermediate version that an older version of dranet cannot read.
+//
+// If the database version is newer than target, migrateSchema returns an error and
+// refuses to open it. Checkpointed state (such as DHCP leases) cannot be rebuilt from
+// the system, so dranet fails early instead of discarding or corrupting data.
+func migrateSchema(tx *bolt.Tx, target int, migrations map[int]func(tx *bolt.Tx) error) error {
+	meta, err := tx.CreateBucketIfNotExists(metaBucket)
+	if err != nil {
+		return err
+	}
+	version := 1
+	if raw := meta.Get(schemaVersionKey); raw != nil {
+		version, err = strconv.Atoi(string(raw))
+		if err != nil || version < 1 {
+			return fmt.Errorf("malformed checkpoint schema version %q", raw)
+		}
+	}
+	if version > target {
+		return fmt.Errorf("checkpoint schema version %d is newer than the supported %d, refusing to load it: remove the db to discard the newer state", version, target)
+	}
+	for ; version < target; version++ {
+		migrate, ok := migrations[version]
+		if !ok {
+			return fmt.Errorf("no migration from checkpoint schema version %d", version)
+		}
+		if err := migrate(tx); err != nil {
+			return fmt.Errorf("migrate checkpoint schema from version %d to %d: %w", version, version+1, err)
+		}
+	}
+	return meta.Put(schemaVersionKey, []byte(strconv.Itoa(target)))
 }
 
 func (c *boltCheckpointer) Close() error {

@@ -80,6 +80,46 @@ kubectl -n kube-system rollout restart ds dranet
 daemonset.apps/dranet restarted
 ```
 
+## Checkpoint database: upgrades and rollbacks
+
+DRANET stores device state (`DeviceConfig`) in a node-local bbolt database
+(`--db-path`, default `/var/run/dranet/dranet.db`) so state like DHCP leases
+survives daemon restarts. The database uses bbolt's file lock and is local to
+each node.
+
+The database layout version is stored under the `meta/schemaVersion` key
+(`checkpointSchemaVersion` in `pkg/driver/pod_device_config_bolt.go`). Databases
+without a `meta` bucket were created before versioning and are treated as version 1.
+
+Migrations run sequentially (for example, v1 -> v2 -> v3 -> v4). All migrations
+and the version update run in a single transaction. If any migration step fails
+(for example, 3 -> 4), the entire transaction rolls back to the starting
+version (v1). This prevents leaving the database in an intermediate version that
+an older version of DRANET cannot read.
+
+### Changing the checkpoint format
+
+`TestDeviceConfigWireFormatGolden` validates the serialized JSON data. When making changes:
+
+1. **Additive changes**: New optional fields (`omitempty`) do not require a
+   version bump. Older versions ignore unknown fields. Update `fullDeviceConfig()`
+   and update the golden test data if needed.
+2. **Breaking changes**: Bump `checkpointSchemaVersion` and add an entry in
+   `checkpointMigrations` for breaking changes (renaming fields, changing types,
+   or modifying bucket layout).
+
+### Upgrade and rollback behavior
+
+| Scenario | Behavior |
+|---|---|
+| Upgrade with additive changes | Existing entries load with new fields unset. |
+| Upgrade with schema bump | Migrations run when opening the database. If a migration fails, the entire transaction rolls back. |
+| Rollback within same schema | The daemon reads existing data and ignores unknown fields. Unmodified entries keep the unknown fields on disk. |
+| Rollback across schema bump | The daemon fails to start because it cannot read a newer schema version. Recover by rolling forward to the newer version, or delete the database file if discarding checkpoint state is acceptable. |
+| Overlapping pods during rolling update | bbolt allows only one process to hold the database file lock. The new pod waits up to 1 second for the lock, then fails and restarts until the old pod exits. |
+
+Every scenario is covered by tests in `pkg/driver/pod_device_config_bolt_version_test.go`.
+
 ## Troubleshooting
 
 ```
