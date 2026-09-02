@@ -34,4 +34,10 @@ const (
 	// (VRF and source-based routing) to avoid ID collisions with reserved
 	// tables (0, 253, 254, 255) and to identify DRANET managed tables.
 	RouteTableOffset = 1000
+
+	// SourceRoutingRulePriority is the priority for provider-generated source
+	// based routing rules. It must be lower than the kernel's implicit "main"
+	// table rule (32766) so matching traffic is routed via the interface's
+	// table instead of falling through to the default route.
+	SourceRoutingRulePriority = 32000
 )

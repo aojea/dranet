@@ -73,6 +73,7 @@ cleanup_veth_interfaces() {
       ip link delete vrf-test-pod-2 || true
       ip link delete pbr-test-pod-1 || true
       ip link delete pbr-test-pod-2 || true
+      ip link delete ipvlan-pbr-a || true
     '
   done
 }
@@ -242,6 +243,48 @@ wait_for_ready_pods() {
 
   # The parent interface still exists on the host.
   run docker exec "$CLUSTER_NAME"-worker ip link show dummy0
+  assert_success
+}
+
+@test "validate pbr configuration with ipvlan subinterface" {
+  local NODE_NAME="$CLUSTER_NAME"-worker
+  local TABLE_ID="150"
+
+  # The ipvlan parent is one end of a veth pair; the peer stays on the host
+  # and owns the gateway address plus an address only reachable through the
+  # PBR table (169.254.202.0/24 has no route in the pod's main table).
+  docker exec "$NODE_NAME" bash -c "ip link add ipvlan-pbr-a type veth peer name ipvlan-pbr-b"
+  docker exec "$NODE_NAME" bash -c "ip link set up dev ipvlan-pbr-a"
+  docker exec "$NODE_NAME" bash -c "ip link set up dev ipvlan-pbr-b"
+  docker exec "$NODE_NAME" bash -c "ip addr add 169.254.201.1/24 dev ipvlan-pbr-b"
+  docker exec "$NODE_NAME" bash -c "ip addr add 169.254.202.1/32 dev ipvlan-pbr-b"
+
+  kubectl apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/deviceclass.yaml
+  kubectl apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/resourceclaim_ipvlan_pbr.yaml
+  wait_for_ready_pods app=pod-ipvlan-pbr 60s
+
+  run kubectl exec pod-ipvlan-pbr -- ip -d link show net1
+  assert_success
+  assert_output --partial "ipvlan"
+
+  # The PBR table holds the gateway link route and the destination route.
+  run kubectl exec pod-ipvlan-pbr -- ip route show table $TABLE_ID
+  assert_success
+  assert_output --partial "169.254.201.1 dev net1 scope link"
+  assert_output --partial "169.254.202.0/24 via 169.254.201.1 dev net1"
+
+  run kubectl exec pod-ipvlan-pbr -- ip rule show
+  assert_success
+  assert_output --regexp "32000:[[:space:]]+from 169.254.201.10 lookup $TABLE_ID"
+  assert_output --regexp "32000:[[:space:]]+from all to 169.254.202.0/24 lookup $TABLE_ID"
+
+  # Connectivity is only possible through the PBR table: the pod's main table
+  # has no route to 169.254.202.1.
+  run kubectl exec pod-ipvlan-pbr -- ping -c 1 -W 2 169.254.202.1
+  assert_success
+
+  # The parent interface still exists on the host.
+  run docker exec "$NODE_NAME" ip link show ipvlan-pbr-a
   assert_success
 }
 

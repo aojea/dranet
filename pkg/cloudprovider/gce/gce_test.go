@@ -262,6 +262,69 @@ func TestGetProfileConfig(t *testing.T) {
 	}
 }
 
+// TestGetProfileConfigSourceRouting verifies that when the VM metadata carries
+// the gateways, the profile returns the full policy based routing configuration
+// (per-device table routes plus per-address source rules) through the existing
+// Routes/Rules API, so the driver applies it with no special casing.
+func TestGetProfileConfigSourceRouting(t *testing.T) {
+	const mac = "00:11:22:33:44:55"
+	iface := gceNetworkInterface{
+		Mac:         mac,
+		IPAliases:   []string{"10.24.3.0/24"},
+		IPv6:        []string{"2001:db8:1234:5678::/64"},
+		Gateway:     "10.24.3.1",
+		GatewayIPv6: "fe80::1",
+	}
+	instance := &GCEInstance{Interfaces: []gceNetworkInterface{iface}, localIPAM: ipam.NewLocalIPAM(nil)}
+	ipvlanConfig := &apis.NetworkConfig{Interface: apis.InterfaceConfig{Type: apis.InterfaceTypeIPVLAN}}
+
+	got, err := instance.GetProfileConfig(cloudprovider.DeviceIdentifiers{MAC: mac}, types.UID("claim-uid"), ipvlanConfig)
+	if err != nil {
+		t.Fatalf("GetProfileConfig() error = %v", err)
+	}
+	if got == nil || len(got.Interface.Addresses) != 2 {
+		t.Fatalf("GetProfileConfig() = %#v, want 2 allocated addresses", got)
+	}
+
+	table := apis.TableIDForName(mac)
+	wantRoutes := []apis.RouteConfig{
+		{Destination: "10.24.3.1/32", Scope: 253, Table: table},
+		{Destination: "0.0.0.0/0", Gateway: "10.24.3.1", Table: table},
+		{Destination: "fe80::1/128", Scope: 253, Table: table},
+		{Destination: "::/0", Gateway: "fe80::1", Table: table},
+	}
+	if diff := cmp.Diff(wantRoutes, got.Routes); diff != "" {
+		t.Errorf("Routes mismatch (-want +got):\n%s", diff)
+	}
+
+	if len(got.Rules) != 2 {
+		t.Fatalf("expected 2 rules, got %d: %+v", len(got.Rules), got.Rules)
+	}
+	// Allocated addresses are already host prefixes, so rule sources match them.
+	for i, rule := range got.Rules {
+		if rule.Source != got.Interface.Addresses[i] || rule.Table != table || rule.Priority != apis.SourceRoutingRulePriority {
+			t.Errorf("rule[%d] = %+v, want source %s table %d priority %d", i, rule, got.Interface.Addresses[i], table, apis.SourceRoutingRulePriority)
+		}
+	}
+
+	// A config that already carries routes or rules owns its routing:
+	// the profile must only return the allocated addresses.
+	userOwned := &apis.NetworkConfig{
+		Interface: apis.InterfaceConfig{Type: apis.InterfaceTypeIPVLAN},
+		Routes:    []apis.RouteConfig{{Destination: "0.0.0.0/0", Gateway: "10.24.3.1"}},
+	}
+	got, err = instance.GetProfileConfig(cloudprovider.DeviceIdentifiers{MAC: mac}, types.UID("claim-uid-2"), userOwned)
+	if err != nil {
+		t.Fatalf("GetProfileConfig() error = %v", err)
+	}
+	if got == nil || len(got.Interface.Addresses) != 2 {
+		t.Fatalf("GetProfileConfig() = %#v, want 2 allocated addresses", got)
+	}
+	if len(got.Routes) != 0 || len(got.Rules) != 0 {
+		t.Errorf("expected no synthesized routes/rules for user-owned routing, got routes %+v rules %+v", got.Routes, got.Rules)
+	}
+}
+
 func TestGetIPv6Range(t *testing.T) {
 	tests := []struct {
 		name      string

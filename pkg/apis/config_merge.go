@@ -53,6 +53,7 @@ func MergeNetworkConfig(user, cloud *NetworkConfig) *NetworkConfig {
 	// iterate backwards). Routes to the same destination in different tables are distinct entries
 	// (policy routing) and are all kept.
 	merged.Routes = deduplicateRoutes(merged.Routes)
+	merged.Rules = deduplicateRules(merged.Rules)
 	merged.Neighbors = deduplicateNeighbors(merged.Neighbors)
 
 	// Drop the meaningless IPVLAN config if the resolved type is not ipvlan.
@@ -90,6 +91,18 @@ func deduplicateRoutes(routes []RouteConfig) []RouteConfig {
 		if !seen[key] {
 			seen[key] = true
 			res = append([]RouteConfig{routes[i]}, res...)
+		}
+	}
+	return res
+}
+
+func deduplicateRules(rules []RuleConfig) []RuleConfig {
+	seen := make(map[RuleConfig]bool)
+	var res []RuleConfig
+	for i := len(rules) - 1; i >= 0; i-- {
+		if !seen[rules[i]] {
+			seen[rules[i]] = true
+			res = append([]RuleConfig{rules[i]}, res...)
 		}
 	}
 	return res

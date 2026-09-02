@@ -568,6 +568,15 @@ func (db *DB) updateDeviceStore(devices []resourceapi.Device) {
 			}
 
 			if conf := db.instance.GetDeviceConfig(id); conf != nil {
+				// A provider-advertised profile is only honored when a profile
+				// provider is wired (e.g. --profile-provider=cloud); drop it
+				// otherwise so claims don't fail resolving it. A user-specified
+				// profile is still a hard requirement.
+				if conf.Profile != "" && db.getProfileProvider() == nil {
+					confCopy := *conf
+					confCopy.Profile = ""
+					conf = &confCopy
+				}
 				deviceConfigStore[device.Name] = conf
 			}
 		}

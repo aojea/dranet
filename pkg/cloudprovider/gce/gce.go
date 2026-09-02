@@ -21,12 +21,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/netip"
 	"path"
 	"strconv"
 	"strings"
 	"time"
 
 	"cloud.google.com/go/compute/metadata"
+	"golang.org/x/sys/unix"
 
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/klog/v2"
@@ -80,13 +82,14 @@ var (
 
 // gceNetworkInterface matches the structure expected from GCE metadata.
 type gceNetworkInterface struct {
-	IPv4      string   `json:"ip,omitempty"`
-	IPv6      []string `json:"ipv6,omitempty"`
-	Mac       string   `json:"mac,omitempty"`
-	MTU       int      `json:"mtu,omitempty"`
-	Network   string   `json:"network,omitempty"`
-	IPAliases []string `json:"ipAliases,omitempty"`
-	Gateway   string   `json:"gateway,omitempty"`
+	IPv4        string   `json:"ip,omitempty"`
+	IPv6        []string `json:"ipv6,omitempty"`
+	Mac         string   `json:"mac,omitempty"`
+	MTU         int      `json:"mtu,omitempty"`
+	Network     string   `json:"network,omitempty"`
+	IPAliases   []string `json:"ipAliases,omitempty"`
+	Gateway     string   `json:"gateway,omitempty"`
+	GatewayIPv6 string   `json:"gatewayIpv6,omitempty"`
 }
 
 var _ cloudprovider.CloudInstance = (*GCEInstance)(nil)
@@ -159,10 +162,17 @@ func (g *GCEInstance) GetDeviceAttributes(id cloudprovider.DeviceIdentifiers) ma
 	return attributes
 }
 
+// ManagedProfile is the profile GCE advertises on every device it recognizes,
+// so claim-scoped resolution (GetProfileConfig) always runs on GCE without the
+// user having to set interface.profile. Resolution is a no-op unless the claim
+// requests something GCE manages dynamically (e.g. an IPVLAN subinterface,
+// which gets IPAM addresses plus its policy based routing).
+const ManagedProfile = "gce-managed"
+
 // GetDeviceConfig fetches any infrastructure-specific network configuration
 // required by the device. Returning nil means no specific config is needed.
 func (g *GCEInstance) GetDeviceConfig(id cloudprovider.DeviceIdentifiers) *apis.NetworkConfig {
-	return nil
+	return &apis.NetworkConfig{Profile: ManagedProfile}
 }
 
 func (g *GCEInstance) GetProfileConfig(id cloudprovider.DeviceIdentifiers, claimUID types.UID, config *apis.NetworkConfig) (*apis.NetworkConfig, error) {
@@ -196,7 +206,7 @@ func (g *GCEInstance) GetProfileConfig(id cloudprovider.DeviceIdentifiers, claim
 		if err := g.localIPAM.Reserve(config.Interface.Addresses); err != nil {
 			return nil, fmt.Errorf("reserving static subinterface addresses for device %q: %w", id.MAC, err)
 		}
-		return nil, nil
+		return sourceRoutingConfig(interfaceForMac, config, nil), nil
 	}
 
 	// Otherwise allocate node-local IPs from the interface's cloud ranges.
@@ -211,7 +221,72 @@ func (g *GCEInstance) GetProfileConfig(id cloudprovider.DeviceIdentifiers, claim
 	if err != nil {
 		return nil, fmt.Errorf("allocating subinterface addresses for device %q: %w", id.MAC, err)
 	}
-	return &apis.NetworkConfig{Interface: apis.InterfaceConfig{Addresses: addrs}}, nil
+	return sourceRoutingConfig(interfaceForMac, config, addrs), nil
+}
+
+// sourceRoutingConfig builds the profile config for a subinterface: the newly
+// allocated addresses (if any) plus the policy based routing (PBR) needed for
+// them to egress via the parent NIC's gateway: a per-device routing table
+// holding an on-link gateway route and a default route, and one source rule per
+// address. When the merged config already carries routes, rules or a VRF, the
+// user/provider owns routing and nothing is synthesized.
+func sourceRoutingConfig(iface gceNetworkInterface, config *apis.NetworkConfig, allocated []string) *apis.NetworkConfig {
+	profile := &apis.NetworkConfig{Interface: apis.InterfaceConfig{Addresses: allocated}}
+
+	addrs := allocated
+	if len(addrs) == 0 {
+		addrs = config.Interface.Addresses
+	}
+	if len(config.Routes) > 0 || len(config.Rules) > 0 || config.Interface.VRF != nil {
+		if len(allocated) == 0 {
+			return nil
+		}
+		return profile
+	}
+
+	// Gateways from the VM metadata, keyed by netip.Addr.Is6().
+	gateways := map[bool]netip.Addr{}
+	if gw, err := netip.ParseAddr(iface.Gateway); err == nil && gw.Is4() {
+		gateways[false] = gw
+	}
+	if gw, err := netip.ParseAddr(iface.GatewayIPv6); err == nil && gw.Is6() {
+		gateways[true] = gw
+	}
+
+	tableID := apis.TableIDForName(iface.Mac)
+	routesAdded := map[bool]bool{}
+	for _, addrStr := range addrs {
+		prefix, err := netip.ParsePrefix(addrStr)
+		if err != nil {
+			continue
+		}
+		is6 := prefix.Addr().Is6()
+		gw, ok := gateways[is6]
+		if !ok {
+			continue
+		}
+		if !routesAdded[is6] {
+			defaultDst := "0.0.0.0/0"
+			if is6 {
+				defaultDst = "::/0"
+			}
+			profile.Routes = append(profile.Routes,
+				// On-link route so the gateway is reachable from a host-prefix address.
+				apis.RouteConfig{Destination: netip.PrefixFrom(gw, gw.BitLen()).String(), Scope: unix.RT_SCOPE_LINK, Table: tableID},
+				apis.RouteConfig{Destination: defaultDst, Gateway: gw.String(), Table: tableID})
+			routesAdded[is6] = true
+		}
+		// Host prefix (/32 or /128) so rules for sibling subinterfaces never overlap.
+		profile.Rules = append(profile.Rules, apis.RuleConfig{
+			Source:   netip.PrefixFrom(prefix.Addr(), prefix.Addr().BitLen()).String(),
+			Table:    tableID,
+			Priority: apis.SourceRoutingRulePriority,
+		})
+	}
+	if len(allocated) == 0 && len(profile.Routes) == 0 && len(profile.Rules) == 0 {
+		return nil
+	}
+	return profile
 }
 
 func (g *GCEInstance) ReleaseProfileConfig(id cloudprovider.DeviceIdentifiers, claimUID types.UID, config *apis.NetworkConfig) error {
