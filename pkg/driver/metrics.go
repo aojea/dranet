@@ -35,6 +35,7 @@ const (
 	methodStopPodSandbox          = "StopPodSandbox"
 	methodRemovePodSandbox        = "RemovePodSandbox"
 	methodCreateContainer         = "CreateContainer"
+	methodStartContainer          = "StartContainer"
 )
 
 var registerMetricsOnce sync.Once
@@ -47,10 +48,20 @@ func registerMetrics() {
 		prometheus.MustRegister(nriPluginRequestsLatencySeconds)
 		prometheus.MustRegister(publishedDevicesTotal)
 		prometheus.MustRegister(lastPublishedTime)
+		prometheus.MustRegister(containerHooksTotal)
+		prometheus.MustRegister(runtimeHooksCompletedTotal)
 	})
 }
 
 var (
+	containerHooksTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "dranet", Subsystem: "driver", Name: "container_hooks_total",
+		Help: "Provider hooks injected into containers. Repeated injections can indicate post-configuration failures.",
+	}, []string{"type"})
+	runtimeHooksCompletedTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "dranet", Subsystem: "driver", Name: "runtime_hooks_completed_total",
+		Help: "Pods whose runtime hooks completed. Compare with hook injections to identify repeated startup failures.",
+	})
 	draPluginRequestsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "dranet",
 		Subsystem: "driver",

@@ -15,7 +15,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({
                 "cloudProvider": True,
-                "profileProvider": True
+                "profileProvider": True,
+                "runtimeHook": True
             }).encode('utf-8'))
         else:
             self.send_response(404)
@@ -55,7 +56,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
             resp = {}
             config_obj = req_json.get("config", {})
             profile_name = config_obj.get("profile")
-            if profile_name == "python-profile":
+            if profile_name in ("python-profile", "python-profile-fail", "python-profile-retry", "python-profile-timeout"):
                 resp = {
                     "interface": {
                         "addresses": ["10.200.200.200/24"]
@@ -67,6 +68,30 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self.send_header('Content-type', 'application/json')
             self.end_headers()
             self.wfile.write(b'{}')
+        elif self.path == '/GetRuntimeHook':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+
+            # The python-profile runs a post-configuration hook on the node
+            # when the pod's containers are created, with opaque data.
+            resp = None
+            config_obj = req_json.get("config", {})
+            profile_name = config_obj.get("profile")
+            if profile_name in ("python-profile", "python-profile-fail", "python-profile-retry", "python-profile-timeout"):
+                resp = {
+                    "path": "/opt/dranet/bin/python-post-hook.sh",
+                    "timeoutSeconds": 5,
+                    "data": {"vendor": "python", "rail": 1}
+                }
+                if profile_name == "python-profile-fail":
+                    resp["data"]["failUntil"] = -1
+                elif profile_name == "python-profile-retry":
+                    resp["data"]["failUntil"] = 1
+                elif profile_name == "python-profile-timeout":
+                    resp["data"]["timeout"] = True
+                    resp["timeoutSeconds"] = 1
+            self.wfile.write(json.dumps(resp).encode('utf-8'))
         elif self.path == '/GetDeviceAttributes':
             self.send_response(200)
             self.send_header('Content-type', 'application/json')

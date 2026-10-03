@@ -18,17 +18,202 @@ package driver
 
 import (
 	"context"
+	"encoding/json"
+	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/containerd/nri/pkg/api"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	resourceapi "k8s.io/api/resource/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/dranet/pkg/apis"
 	"sigs.k8s.io/dranet/pkg/inventory"
 )
+
+func TestCreateContainerRuntimeHooks(t *testing.T) {
+	pod := &api.PodSandbox{Uid: "pod-hooks", Name: "test-pod", Namespace: "default", Linux: &api.LinuxPodSandbox{
+		Namespaces: []*api.LinuxNamespace{{Type: "network", Path: "/var/run/netns/pod-hooks"}},
+	}}
+	newDriver := func(t *testing.T, hooks ...*apis.RuntimeHook) *NetworkDriver {
+		t.Helper()
+		np := &NetworkDriver{podConfigStore: mustNewPodConfigStore()}
+		for index, hook := range hooks {
+			name := "device-" + string(rune('0'+index))
+			config := DeviceConfig{
+				Claim:                        types.NamespacedName{Namespace: "default", Name: "claim"},
+				ResourceClaim:                &resourceapi.ResourceClaim{ObjectMeta: metav1.ObjectMeta{Name: "claim", Namespace: "default", UID: "claim-uid"}},
+				NetworkInterfaceConfigInHost: apis.NetworkConfig{Interface: apis.InterfaceConfig{Name: name}},
+				NetworkInterfaceConfigInPod:  apis.NetworkConfig{Interface: apis.InterfaceConfig{Name: name}},
+				RuntimeHook:                  hook,
+			}
+			if err := np.podConfigStore.SetDeviceConfig(types.UID(pod.Uid), name, config); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return np
+	}
+	t.Run("deduplicated with maximum timeout and per-device data", func(t *testing.T) {
+		np := newDriver(t,
+			&apis.RuntimeHook{Path: "/opt/example/hook", TimeoutSeconds: 5},
+			&apis.RuntimeHook{Path: "/opt/example/hook", TimeoutSeconds: 20, Data: json.RawMessage(`{"rail":1}`)},
+		)
+		for attempt := 0; attempt < 100; attempt++ {
+			adjust, _, err := np.CreateContainer(t.Context(), pod, &api.Container{Name: "app"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			hooks := adjust.GetHooks().GetCreateRuntime()
+			if len(hooks) != 1 || hooks[0].Timeout.GetValue() != 20 {
+				t.Fatalf("expected one 20-second hook, got %v", hooks)
+			}
+			var claims []apis.HookClaim
+			for _, entry := range hooks[0].Env {
+				if value, found := strings.CutPrefix(entry, apis.HookEnvClaims+"="); found {
+					if err := json.Unmarshal([]byte(value), &claims); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			if len(claims) != 1 || len(claims[0].Devices) != 2 || string(claims[0].Devices[1].Data) != `{"rail":1}` || claims[0].Claim.UID != "claim-uid" {
+				t.Fatalf("unexpected claim environment: %#v", claims)
+			}
+		}
+	})
+	t.Run("empty argument is a distinct invocation", func(t *testing.T) {
+		np := newDriver(t, &apis.RuntimeHook{Path: "/opt/example/hook"}, &apis.RuntimeHook{Path: "/opt/example/hook", Args: []string{""}})
+		adjust, _, err := np.CreateContainer(t.Context(), pod, &api.Container{Name: "app"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		hooks := adjust.GetHooks().GetCreateRuntime()
+		if len(hooks) != 2 || len(hooks[0].Args) != 1 || len(hooks[1].Args) != 2 {
+			t.Fatalf("unexpected invocations: %v", hooks)
+		}
+	})
+	for _, names := range [][]string{{"app"}, {"first", "second"}} {
+		t.Run("failure and retry with "+strings.Join(names, "/"), func(t *testing.T) {
+			np := newDriver(t, &apis.RuntimeHook{Path: "/bin/sh", Args: []string{"-c", `if [ "$FAIL_POST_CONFIG" = "1" ]; then printf 'post-configuration failed\n' >&2; exit 1; fi`}})
+			original, _ := np.podConfigStore.GetDeviceConfig(types.UID(pod.Uid), "device-0")
+			for _, name := range append([]string{names[0]}, names...) {
+				adjust, _, err := np.CreateContainer(t.Context(), pod, &api.Container{Name: name})
+				if err != nil || len(adjust.GetHooks().GetCreateRuntime()) != 1 {
+					t.Fatalf("pending hooks missing: %v, %v", adjust, err)
+				}
+				hook := adjust.Hooks.CreateRuntime[0]
+				command := exec.Command(hook.Path, hook.Args[1:]...)
+				command.Env = append(hook.Env, "FAIL_POST_CONFIG=1")
+				command.Stdin = strings.NewReader(`{"id":"container-id","status":"creating"}`)
+				output, err := command.CombinedOutput()
+				if err == nil || !strings.Contains(string(output), "post-configuration failed") {
+					t.Fatalf("expected executable failure: %q, %v", output, err)
+				}
+				config, _ := np.podConfigStore.GetDeviceConfig(types.UID(pod.Uid), "device-0")
+				if !reflect.DeepEqual(original, config) {
+					t.Fatal("failed startup changed the prepared configuration")
+				}
+			}
+			successful := &api.Container{Name: names[len(names)-1]}
+			adjust, _, err := np.CreateContainer(t.Context(), pod, successful)
+			if err != nil {
+				t.Fatal(err)
+			}
+			hook := adjust.Hooks.CreateRuntime[0]
+			command := exec.Command(hook.Path, hook.Args[1:]...)
+			command.Env = hook.Env
+			if output, err := command.CombinedOutput(); err != nil {
+				t.Fatalf("successful retry: %q, %v", output, err)
+			}
+			if err := np.StartContainer(t.Context(), pod, successful); err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range names {
+				adjust, _, err := np.CreateContainer(t.Context(), pod, &api.Container{Name: name})
+				if err != nil || len(adjust.GetHooks().GetCreateRuntime()) != 0 {
+					t.Fatalf("completed hooks repeated: %v, %v", adjust, err)
+				}
+			}
+			if err := np.podConfigStore.SetRuntimeHooksDone(types.UID(pod.Uid), false); err != nil {
+				t.Fatal(err)
+			}
+			adjust, _, err = np.CreateContainer(t.Context(), pod, successful)
+			if err != nil || len(adjust.GetHooks().GetCreateRuntime()) != 1 {
+				t.Fatalf("reset hooks missing: %v, %v", adjust, err)
+			}
+		})
+	}
+	t.Run("chain cap", func(t *testing.T) {
+		var hooks []*apis.RuntimeHook
+		for index := 0; index <= apis.RuntimeHookChainMaxTimeoutSeconds/apis.RuntimeHookMaxTimeoutSeconds; index++ {
+			hooks = append(hooks, &apis.RuntimeHook{Path: "/opt/example/hook" + string(rune('a'+index)), TimeoutSeconds: apis.RuntimeHookMaxTimeoutSeconds})
+		}
+		np := newDriver(t, hooks...)
+		if _, _, err := np.CreateContainer(t.Context(), pod, &api.Container{Name: "app"}); err == nil || !strings.Contains(err.Error(), "over the maximum") {
+			t.Fatalf("expected chain cap failure, got %v", err)
+		}
+	})
+	t.Run("environment cap", func(t *testing.T) {
+		np := newDriver(t, &apis.RuntimeHook{Path: "/opt/example/hook"})
+		config, _ := np.podConfigStore.GetDeviceConfig(types.UID(pod.Uid), "device-0")
+		config.ResourceClaim.Annotations = map[string]string{"large": strings.Repeat("x", apis.HookEnvMaxBytes)}
+		if err := np.podConfigStore.SetDeviceConfig(types.UID(pod.Uid), "device-0", config); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := np.CreateContainer(t.Context(), pod, &api.Container{Name: "app"}); err == nil || !strings.Contains(err.Error(), "kernel allows") {
+			t.Fatalf("expected environment cap failure, got %v", err)
+		}
+	})
+}
+
+func TestRuntimeHookCheckpoint(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "runtime-hook.db")
+	podUID := types.UID("hook-pod")
+	config := DeviceConfig{
+		Claim:         types.NamespacedName{Namespace: "default", Name: "hook-claim"},
+		ResourceClaim: &resourceapi.ResourceClaim{ObjectMeta: metav1.ObjectMeta{Name: "hook-claim", Namespace: "default", UID: "hook-claim-uid"}},
+		RuntimeHook:   &apis.RuntimeHook{Path: "/opt/example/hook", Args: []string{"--configure"}, TimeoutSeconds: 20, Data: json.RawMessage(`{"rail":1}`)},
+	}
+	store, err := NewPodConfigStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetDeviceConfig(podUID, "device", config); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetRuntimeHooksDone(podUID, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = NewPodConfigStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	config.RuntimeHookDone = true
+	restored, found := store.GetDeviceConfig(podUID, "device")
+	if !found || !reflect.DeepEqual(config, restored) {
+		t.Fatalf("runtime checkpoint mismatch: %#v", restored)
+	}
+	np := &NetworkDriver{podConfigStore: store}
+	pod := &api.PodSandbox{Uid: string(podUID), Name: "pod", Namespace: "default"}
+	adjust, _, err := np.CreateContainer(t.Context(), pod, &api.Container{Name: "later"})
+	if err != nil || len(adjust.GetHooks().GetCreateRuntime()) != 0 {
+		t.Fatalf("completed hooks repeated after restart: %v, %v", adjust, err)
+	}
+	if err := store.SetRuntimeHooksDone(podUID, false); err != nil {
+		t.Fatal(err)
+	}
+	adjust, _, err = np.CreateContainer(t.Context(), pod, &api.Container{Name: "new-sandbox"})
+	if err != nil || len(adjust.GetHooks().GetCreateRuntime()) != 1 {
+		t.Fatalf("reset hooks missing after restart: %v, %v", adjust, err)
+	}
+}
 
 func TestCreateContainerNoDuplicateDevices(t *testing.T) {
 	np := &NetworkDriver{

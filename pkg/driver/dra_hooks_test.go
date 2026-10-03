@@ -256,6 +256,54 @@ func TestUnprepareResourceClaimsMetrics(t *testing.T) {
 	})
 }
 
+func TestUnprepareRuntimeHookProfile(t *testing.T) {
+	for _, done := range []bool{false, true} {
+		for _, failRelease := range []bool{false, true} {
+			t.Run(fmt.Sprintf("completed=%t/releaseFailure=%t", done, failRelease), func(t *testing.T) {
+				claim := kubeletplugin.NamespacedObject{NamespacedName: types.NamespacedName{Namespace: "default", Name: "hook-claim"}, UID: "hook-claim-uid"}
+				database := newFakeInventoryDB()
+				database.ReleaseProfileConfigFunc = func(device string, claimUID types.UID, config *apis.NetworkConfig) error {
+					if claimUID != claim.UID || config.Profile != "hook-profile" || !strings.HasPrefix(device, "hook-device-") {
+						t.Fatalf("unexpected release: %s %s %#v", device, claimUID, config)
+					}
+					if failRelease {
+						return fmt.Errorf("cleanup failed")
+					}
+					return nil
+				}
+				np := &NetworkDriver{netdb: database, podConfigStore: mustNewPodConfigStore()}
+				for _, name := range []string{"hook-device-a", "hook-device-b"} {
+					if err := np.podConfigStore.SetDeviceConfig("hook-pod", name, DeviceConfig{
+						Claim: claim.NamespacedName, NetworkInterfaceConfigInPod: apis.NetworkConfig{Profile: "hook-profile"},
+						RuntimeHook: &apis.RuntimeHook{Path: "/opt/example/hook"}, RuntimeHookDone: done,
+					}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := np.podConfigStore.SetDeviceConfig("other-pod", "other-device", DeviceConfig{Claim: types.NamespacedName{Namespace: "default", Name: "other-claim"}}); err != nil {
+					t.Fatal(err)
+				}
+				for attempt := 0; attempt < 2; attempt++ {
+					results, err := np.UnprepareResourceClaims(t.Context(), []kubeletplugin.NamespacedObject{claim})
+					if err != nil || results[claim.UID] != nil {
+						t.Fatalf("unprepare: %v, %v", results, err)
+					}
+				}
+				if calls := database.releaseProfileCalls.Load(); calls != 2 {
+					t.Fatalf("release calls = %d, want one per claimed device, without retry", calls)
+				}
+				if _, found := np.podConfigStore.GetPodConfig("hook-pod"); found {
+					t.Fatal("unprepared claim configuration remained")
+				}
+				podConfig, _ := np.podConfigStore.GetPodConfig("other-pod")
+				if len(podConfig.DeviceConfigs) != 1 || podConfig.DeviceConfigs["other-device"].Claim.Name != "other-claim" {
+					t.Fatalf("incorrect claim cleanup: %#v", podConfig)
+				}
+			})
+		}
+	}
+}
+
 func TestClaimPrepareFailedEvent(t *testing.T) {
 	ctx := context.Background()
 	fakeRecorder := record.NewFakeRecorder(10)
@@ -444,6 +492,60 @@ func TestDynamicProfiles(t *testing.T) {
 		devCfg := podCfg.DeviceConfigs["device-1"]
 		if len(devCfg.NetworkInterfaceConfigInPod.Interface.Addresses) == 0 || devCfg.NetworkInterfaceConfigInPod.Interface.Addresses[0] != "10.0.0.1/24" {
 			t.Errorf("Expected address 10.0.0.1/24 to be merged into pod config, got %v", devCfg.NetworkInterfaceConfigInPod.Interface.Addresses)
+		}
+	})
+
+	t.Run("Runtime hook from the profile provider", func(t *testing.T) {
+		newDB := func(hook *apis.RuntimeHook) *fakeInventoryDB {
+			fakeDB := newFakeInventoryDB()
+			fakeDB.GetProfileConfigFunc = func(string, *resourcev1.ResourceClaim, *apis.NetworkConfig) (*apis.NetworkConfig, error) {
+				return &apis.NetworkConfig{}, nil
+			}
+			fakeDB.GetDeviceConfigFunc = func(string) (*apis.NetworkConfig, bool) {
+				return &apis.NetworkConfig{Profile: "my-profile"}, true
+			}
+			fakeDB.IsIBOnlyDeviceFunc = func(string) bool { return true }
+			fakeDB.GetRuntimeHookFunc = func(_ string, _ *resourcev1.ResourceClaim, config *apis.NetworkConfig) (*apis.RuntimeHook, error) {
+				// The provider decides with the resolved configuration in hand.
+				if config == nil || config.Profile != "my-profile" {
+					return nil, fmt.Errorf("unexpected config %#v", config)
+				}
+				return hook, nil
+			}
+			return fakeDB
+		}
+		claims := []*resourcev1.ResourceClaim{{
+			ObjectMeta: metav1.ObjectMeta{UID: "claim-uid-hook", Namespace: "default", Name: "claim-hook"},
+			Status: resourcev1.ResourceClaimStatus{
+				ReservedFor: []resourcev1.ResourceClaimConsumerReference{{Resource: "pods", Name: "test-pod", UID: "pod-uid-hook"}},
+				Allocation: &resourcev1.AllocationResult{Devices: resourcev1.DeviceAllocationResult{
+					Results: []resourcev1.DeviceRequestAllocationResult{{Driver: "test.driver", Device: "device-1", Request: "req-1"}},
+				}},
+			},
+		}}
+
+		// Stored with the device, with the default timeout applied.
+		hook := &apis.RuntimeHook{Path: "/opt/acme/bin/acme-hook", Data: json.RawMessage(`{"fabric":"a"}`)}
+		np := &NetworkDriver{netdb: newDB(hook), driverName: "test.driver", podConfigStore: mustNewPodConfigStore()}
+		res, err := np.PrepareResourceClaims(ctx, claims)
+		if err != nil || res["claim-uid-hook"].Err != nil {
+			t.Fatalf("PrepareResourceClaims: %v / %v", err, res["claim-uid-hook"].Err)
+		}
+		podCfg, _ := np.podConfigStore.GetPodConfig("pod-uid-hook")
+		got := podCfg.DeviceConfigs["device-1"].RuntimeHook
+		want := &apis.RuntimeHook{Path: "/opt/acme/bin/acme-hook", TimeoutSeconds: apis.RuntimeHookDefaultTimeoutSeconds, Data: json.RawMessage(`{"fabric":"a"}`)}
+		if diff := cmp.Diff(want, got); diff != "" {
+			t.Fatalf("stored hook mismatch (-want +got):\n%s", diff)
+		}
+
+		// An invalid hook fails the preparation and releases the profile.
+		np = &NetworkDriver{netdb: newDB(&apis.RuntimeHook{Path: "relative/hook"}), driverName: "test.driver", podConfigStore: mustNewPodConfigStore(), eventRecorder: record.NewFakeRecorder(10)}
+		res, _ = np.PrepareResourceClaims(ctx, claims)
+		if res["claim-uid-hook"].Err == nil || !strings.Contains(res["claim-uid-hook"].Err.Error(), "not absolute") {
+			t.Fatalf("expected the invalid hook to fail the claim, got %v", res["claim-uid-hook"].Err)
+		}
+		if got := np.netdb.(*fakeInventoryDB).releaseProfileCalls.Load(); got != 1 {
+			t.Fatalf("expected the profile to be released once, got %d", got)
 		}
 	})
 
@@ -1899,6 +2001,13 @@ func testPrepareResourceClaim_Namespaced(t *testing.T) {
 				}
 			}
 
+			if tc.wantPodConfig != nil {
+				for name, config := range tc.wantPodConfig.DeviceConfigs {
+					config.ResourceClaim = tc.claim.DeepCopy()
+					config.ResourceClaim.ManagedFields = nil
+					tc.wantPodConfig.DeviceConfigs[name] = config
+				}
+			}
 			opts := []cmp.Option{cmpopts.EquateEmpty(), cmpopts.IgnoreFields(PodConfig{}, "LastNRIActivity")}
 			if diff := cmp.Diff(tc.wantPodConfig, gotPodConfig, opts...); diff != "" {
 				t.Errorf("PodConfig mismatch (-want +got):\n%s", diff)

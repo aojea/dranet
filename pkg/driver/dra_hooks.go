@@ -294,8 +294,25 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 			Namespace: claim.Namespace,
 			Name:      claim.Name,
 		},
+		ResourceClaim:               claim.DeepCopy(),
 		NetworkInterfaceConfigInPod: netconf,
 		DeviceSnapshot:              deviceSnapshot,
+	}
+	deviceCfg.ResourceClaim.ManagedFields = nil
+
+	// The profile provider decides at prepare time whether a binary runs on
+	// the node when the Pod's containers are created, after the attach.
+	if netconf.Profile != "" {
+		hook, err := np.netdb.GetRuntimeHook(result.Device, claim, &netconf)
+		if err != nil {
+			return fmt.Errorf("failed to get the runtime hook for device %s: %w", result.Device, err)
+		}
+		if hook != nil {
+			if err := hook.Validate(); err != nil {
+				return fmt.Errorf("invalid runtime hook for device %s: %w", result.Device, err)
+			}
+			deviceCfg.RuntimeHook = hook
+		}
 	}
 
 	// IB-only path: device has RDMA capability but no netdev interface.

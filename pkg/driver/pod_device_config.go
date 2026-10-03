@@ -47,7 +47,10 @@ type PodConfig struct {
 // network device allocated to a Pod. This includes network interface settings,
 // routes for the Pod's network namespace, and RDMA configurations.
 type DeviceConfig struct {
-	Claim types.NamespacedName `json:"claim"`
+	Claim           types.NamespacedName       `json:"claim"`
+	ResourceClaim   *resourceapi.ResourceClaim `json:"resourceClaim,omitempty"`
+	RuntimeHook     *apis.RuntimeHook          `json:"runtimeHook,omitempty"`
+	RuntimeHookDone bool                       `json:"runtimeHookDone,omitempty"`
 
 	// DeviceSnapshot contains the original discovered ResourceSlice Device structure,
 	// which includes the device's identifying attributes and capacity.
@@ -273,6 +276,28 @@ func (s *PodConfigStore) GetDeviceConfig(podUID types.UID, deviceName string) (D
 		return config, found
 	}
 	return DeviceConfig{}, false
+}
+
+func (s *PodConfigStore) SetRuntimeHooksDone(podUID types.UID, done bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	podConfig, ok := s.configs[podUID]
+	if !ok {
+		return fmt.Errorf("pod %s not found", podUID)
+	}
+	for deviceName, config := range podConfig.DeviceConfigs {
+		if config.RuntimeHookDone == done {
+			continue
+		}
+		config.RuntimeHookDone = done
+		if s.checkpointer != nil {
+			if err := s.checkpointer.Store(podUID, deviceName, config); err != nil {
+				return fmt.Errorf("checkpoint runtime hook state for pod %s device %s: %w", podUID, deviceName, err)
+			}
+		}
+		podConfig.DeviceConfigs[deviceName] = config
+	}
+	return nil
 }
 
 // DeletePod removes all configurations associated with a given Pod UID.

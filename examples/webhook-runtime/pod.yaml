@@ -1,0 +1,44 @@
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: dranet-runtime-hook
+spec:
+  selectors:
+  - cel:
+      expression: device.driver == "dra.net"
+---
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: runtime-hook
+spec:
+  spec:
+    devices:
+      requests:
+      - name: network
+        exactly:
+          deviceClassName: dranet-runtime-hook
+          selectors:
+          - cel:
+              expression: has(device.attributes["dra.net"].ifName) && device.attributes["dra.net"].ifName == "post0"
+      config:
+      - opaque:
+          driver: dra.net
+          parameters:
+            profile: example.com/tuning
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: runtime-hook
+spec:
+  containers:
+  - name: app
+    image: registry.k8s.io/e2e-test-images/agnhost:2.54
+    command: ["sleep", "infinity"]
+  - name: second
+    image: registry.k8s.io/e2e-test-images/agnhost:2.54
+    command: ["sleep", "infinity"]
+  resourceClaims:
+  - name: network
+    resourceClaimTemplateName: runtime-hook

@@ -18,19 +18,25 @@ package driver
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/containerd/nri/pkg/api"
 
 	v1 "k8s.io/api/core/v1"
+	resourceapi "k8s.io/api/resource/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	metav1apply "k8s.io/client-go/applyconfigurations/meta/v1"
 	resourceapply "k8s.io/client-go/applyconfigurations/resource/v1"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/set"
+	"sigs.k8s.io/dranet/pkg/apis"
 )
 
 // NRI hooks into the container runtime, the lifecycle of the Pod seen here is local to the runtime
@@ -94,10 +100,28 @@ func (np *NetworkDriver) CreateContainer(ctx context.Context, pod *api.PodSandbo
 	return adjust, update, err
 }
 
-func (np *NetworkDriver) createContainer(_ context.Context, _ *api.PodSandbox, _ *api.Container, podConfig PodConfig) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
+func (np *NetworkDriver) createContainer(ctx context.Context, pod *api.PodSandbox, _ *api.Container, podConfig PodConfig) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
 	// Containers only care about the RDMA char devices.
 	devPaths := set.Set[string]{}
 	adjust := &api.ContainerAdjustment{}
+	hooks := runtimeHooks(podConfig)
+	if len(hooks) > 0 {
+		env, err := np.hookEnv(pod, podConfig)
+		if err != nil {
+			return nil, nil, err
+		}
+		chainTimeout := 0
+		for _, hook := range hooks {
+			hook.Env = env
+			chainTimeout += int(hook.Timeout.GetValue())
+		}
+		if chainTimeout > apis.RuntimeHookChainMaxTimeoutSeconds {
+			return nil, nil, fmt.Errorf("the hooks of pod %s/%s may take up to %ds, over the maximum of %ds for one container", pod.GetNamespace(), pod.GetName(), chainTimeout, apis.RuntimeHookChainMaxTimeoutSeconds)
+		}
+		adjust.AddHooks(&api.Hooks{CreateRuntime: hooks})
+		containerHooksTotal.WithLabelValues("provider").Add(float64(len(hooks)))
+		klog.FromContext(ctx).V(2).Info("Added post-configuration hooks", "hooks", len(hooks), "chainTimeout", chainTimeout)
+	}
 
 	for _, config := range podConfig.DeviceConfigs {
 		for _, dev := range config.RDMADevice.DevChars {
@@ -119,6 +143,110 @@ func (np *NetworkDriver) createContainer(_ context.Context, _ *api.PodSandbox, _
 	return adjust, nil, nil
 }
 
+func runtimeHooks(podConfig PodConfig) []*api.Hook {
+	seen := map[string]*api.Hook{}
+	var hooks []*api.Hook
+	for _, config := range podConfig.DeviceConfigs {
+		hook := config.RuntimeHook
+		if hook == nil || config.RuntimeHookDone {
+			continue
+		}
+		args := append([]string{filepath.Base(hook.Path)}, hook.Args...)
+		key := hook.Path + "\x00" + strings.Join(args, "\x00")
+		timeout := hook.TimeoutSeconds
+		if timeout == 0 {
+			timeout = apis.RuntimeHookDefaultTimeoutSeconds
+		}
+		if existing, ok := seen[key]; ok {
+			existing.Timeout = api.Int(max(int(existing.Timeout.GetValue()), timeout))
+			continue
+		}
+		entry := &api.Hook{Path: hook.Path, Args: args, Timeout: api.Int(timeout)}
+		seen[key] = entry
+		hooks = append(hooks, entry)
+	}
+	sort.Slice(hooks, func(first, second int) bool {
+		return hooks[first].Path+"\x00"+strings.Join(hooks[first].Args, "\x00") < hooks[second].Path+"\x00"+strings.Join(hooks[second].Args, "\x00")
+	})
+	return hooks
+}
+
+func (np *NetworkDriver) hookEnv(pod *api.PodSandbox, podConfig PodConfig) ([]string, error) {
+	byClaim := map[types.NamespacedName]*apis.HookClaim{}
+	for name, config := range podConfig.DeviceConfigs {
+		device := apis.HookDevice{Name: name, Device: apis.DeviceIdentifiersFromDevice(config.DeviceSnapshot)}
+		if device.Device.Name == "" {
+			device.Device.Name = config.NetworkInterfaceConfigInHost.Interface.Name
+		}
+		if config.NetworkInterfaceConfigInHost.Interface.Name != "" {
+			conf := config.NetworkInterfaceConfigInPod
+			device.Config = &conf
+		}
+		if config.RuntimeHook != nil {
+			device.Data = config.RuntimeHook.Data
+		}
+		hookClaim, ok := byClaim[config.Claim]
+		if !ok {
+			hookClaim = &apis.HookClaim{Claim: config.ResourceClaim}
+			if hookClaim.Claim == nil {
+				hookClaim.Claim = &resourceapi.ResourceClaim{ObjectMeta: metav1.ObjectMeta{Namespace: config.Claim.Namespace, Name: config.Claim.Name}}
+			}
+			byClaim[config.Claim] = hookClaim
+		}
+		hookClaim.Devices = append(hookClaim.Devices, device)
+	}
+	claims := make([]apis.HookClaim, 0, len(byClaim))
+	for _, claim := range byClaim {
+		sort.Slice(claim.Devices, func(first, second int) bool { return claim.Devices[first].Name < claim.Devices[second].Name })
+		claims = append(claims, *claim)
+	}
+	sort.Slice(claims, func(first, second int) bool {
+		return claims[first].Claim.Namespace+"/"+claims[first].Claim.Name < claims[second].Claim.Namespace+"/"+claims[second].Claim.Name
+	})
+	claimsJSON, err := json.Marshal(claims)
+	if err != nil {
+		return nil, fmt.Errorf("encode the hook claims: %w", err)
+	}
+	if size := len(apis.HookEnvClaims) + 1 + len(claimsJSON); size > apis.HookEnvMaxBytes {
+		return nil, fmt.Errorf("the claims of pod %s/%s take %d bytes in the hook environment, over the %d the kernel allows for one variable", pod.GetNamespace(), pod.GetName(), size, apis.HookEnvMaxBytes)
+	}
+	ns := getNetworkNamespace(pod)
+	if ns == "" {
+		ns = podConfig.NetNS
+	}
+	return []string{
+		apis.HookEnvPodUID + "=" + pod.GetUid(),
+		apis.HookEnvPodNamespace + "=" + pod.GetNamespace(),
+		apis.HookEnvPodName + "=" + pod.GetName(),
+		apis.HookEnvNetNS + "=" + ns,
+		apis.HookEnvClaims + "=" + string(claimsJSON),
+	}, nil
+}
+
+func (np *NetworkDriver) StartContainer(ctx context.Context, pod *api.PodSandbox, ctr *api.Container) error {
+	logger := klog.LoggerWithValues(klog.FromContext(ctx), "pod", klog.KRef(pod.Namespace, pod.Name), "podUID", pod.Uid, "container", ctr.Name)
+	start := time.Now()
+	status := statusNoop
+	defer func() {
+		nriPluginRequestsTotal.WithLabelValues(methodStartContainer, status).Inc()
+		nriPluginRequestsLatencySeconds.WithLabelValues(methodStartContainer, status).Observe(time.Since(start).Seconds())
+	}()
+	podUID := types.UID(pod.GetUid())
+	podConfig, ok := np.podConfigStore.GetPodConfig(podUID)
+	if !ok || len(runtimeHooks(podConfig)) == 0 {
+		return nil
+	}
+	if err := np.podConfigStore.SetRuntimeHooksDone(podUID, true); err != nil {
+		status = statusFailed
+		logger.Error(err, "Failed to record that the runtime hooks ran")
+		return nil
+	}
+	status = statusSuccess
+	runtimeHooksCompletedTotal.Inc()
+	logger.V(2).Info("Runtime hooks ran for the pod")
+	return nil
+}
+
 func (np *NetworkDriver) RunPodSandbox(ctx context.Context, pod *api.PodSandbox) error {
 	logger := klog.LoggerWithValues(klog.FromContext(ctx), "pod", klog.KRef(pod.Namespace, pod.Name), "podUID", pod.Uid)
 	ctx = klog.NewContext(ctx, logger)
@@ -135,6 +263,10 @@ func (np *NetworkDriver) RunPodSandbox(ctx context.Context, pod *api.PodSandbox)
 	podConfig, ok := np.podConfigStore.GetPodConfig(types.UID(pod.GetUid()))
 	if !ok {
 		return nil
+	}
+	if err := np.podConfigStore.SetRuntimeHooksDone(types.UID(pod.GetUid()), false); err != nil {
+		status = statusFailed
+		return err
 	}
 	err := np.runPodSandbox(ctx, pod, podConfig)
 	if err != nil {

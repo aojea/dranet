@@ -80,6 +80,89 @@ kubectl -n kube-system rollout restart ds dranet
 daemonset.apps/dranet restarted
 ```
 
+## Runtime provider post-configuration
+
+The optional `runtimeHook` webhook capability extends the profile provider.
+`GetRuntimeHook` is called during `NodePrepareResources`, after profile
+resolution. It returns a host binary, arguments, a bounded timeout and
+opaque per-device data. The container runtime executes it as an OCI
+`createRuntime` hook after DRANET's sandbox setup and native network
+configuration. There is no webhook request during hook execution.
+
+The hook only performs post-configuration in `DRANET_NETNS`. It must not
+move, rename or re-address DRANET's interfaces, and it must drain the OCI
+state on stdin without using container identity. DRANET retains attachment
+and teardown. The provider installs the binary and dependencies on every
+node. The hook runs with runtime privileges; this scope is not enforced by
+a sandbox.
+
+### Failure contract
+
+| Failure | Stage | Result |
+|---|---|---|
+| HTTP error or invalid hook response | `NodePrepareResources` | Preparation fails and kubelet retries it. |
+| Hook chain or environment exceeds its limit | NRI `CreateContainer` | Container creation fails before the hook executes. |
+| Missing binary, permission error, non-zero exit or runtime timeout | OCI create during container startup | The container process does not run. Native attachment stays complete and provider hooks remain pending. |
+
+`RuntimeHookDone` is recorded for the Pod's devices only when NRI
+`StartContainer` follows successful OCI creation. Later containers and
+restarts in that sandbox have no provider hooks. A new sandbox clears
+completion. Execution is retryable, not exactly once: hooks may run again
+after partial failure or loss of the completion checkpoint.
+
+For one application container, a failed hook is retried on its next startup
+attempt. For multiple application containers, kubelet can try the next
+container after a failure in the same startup pass. That container also
+receives the pending hooks and may complete post-configuration. The first
+failed container then retries without them. A persistent error prevents
+all container processes from running. A failed regular init container
+blocks application startup until an init attempt completes the hooks.
+
+Distinct hooks run in stable path/argument order after native configuration. Shared
+binary/argument pairs run once per attempt with the largest device timeout.
+Earlier hooks and partial changes remain after failure. Hooks must be
+idempotent and must not depend on which container carries them. DRANET
+does not roll back a failed runtime attempt or invoke an OCI cleanup hook.
+Provider cleanup uses `ReleaseProfileConfig` during `NodeUnprepareResources`,
+for each profiled device whether its runtime hook completed, failed or never
+ran. A startup failure does not trigger release because the prepared profile
+is still needed for kubelet's retry. Preparation failures after allocation
+also release the profile through the existing error path.
+
+The release request contains device identifiers, claim UID and the stored
+network configuration. It does not include hook data or a live Pod network
+namespace. Providers must store additional cleanup state under a stable
+claim/device identity and handle partial setup idempotently. Release errors
+are logged, unprepare continues, and DRANET does not retry the failed release;
+providers must reclaim orphaned resources. A provider wrapping CNI must
+account for `ADD`/`DEL` ordering and implement required release in its profile
+provider. A startup hook alone does not provide the full CNI lifecycle.
+Namespace-local post-configuration is illustrated in
+`examples/webhook-runtime` with the CNI `tuning` binary.
+
+### Focused validation
+
+```sh
+go test ./pkg/apis ./pkg/cloudprovider/webhook ./pkg/driver -run 'TestRuntimeHookValidate|TestWebhookGetRuntimeHook|TestCreateContainerRuntimeHooks|TestUnprepareRuntimeHookProfile' -count=1
+go test ./examples/webhook-runtime -count=1
+bats tests/python_webhook.bats
+```
+
+The Bats suite builds the test image and creates its own kind cluster. It
+checks successful post-configuration, non-zero exits, runtime timeouts and
+recovery for single- and multi-container Pods, plus failure and timeout in
+a regular init container. It verifies that no process starts during a
+persistent hook failure and that a successful attempt suppresses hooks on
+subsequent startup attempts. The executable unit tests validate the driver
+completion state, unprepare cleanup for completed and pending hooks, and CNI
+wrapper error propagation without a cluster.
+
+User-visible failure and troubleshooting details are documented in
+`site/content/docs/concepts/runtime-provider-hooks.md`. Do not describe
+execution as exclusive to the first declared
+container or assume that another application container cannot run after
+the first container's hook fails.
+
 ## Checkpoint database: upgrades and rollbacks
 
 DRANET stores device state (`DeviceConfig`) in a node-local bbolt database
