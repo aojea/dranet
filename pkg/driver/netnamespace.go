@@ -35,6 +35,9 @@ import (
 )
 
 func applyRoutingConfig(containerNsPAth string, ifName string, routeConfig []apis.RouteConfig, vrfTable int) error {
+	if len(routeConfig) == 0 {
+		return nil
+	}
 	containerNs, err := netns.GetFromPath(containerNsPAth)
 	if err != nil {
 		return err
@@ -105,6 +108,9 @@ func applyRoutingConfig(containerNsPAth string, ifName string, routeConfig []api
 }
 
 func applyNeighborConfig(containerNsPAth string, ifName string, neighConfig []apis.NeighborConfig) error {
+	if len(neighConfig) == 0 {
+		return nil
+	}
 	containerNs, err := netns.GetFromPath(containerNsPAth)
 	if err != nil {
 		return fmt.Errorf("could not get network namespace from path %s: %w", containerNsPAth, err)
@@ -148,6 +154,9 @@ func applyNeighborConfig(containerNsPAth string, ifName string, neighConfig []ap
 }
 
 func applyRulesConfig(containerNsPath string, rulesConfig []apis.RuleConfig) error {
+	if len(rulesConfig) == 0 {
+		return nil
+	}
 	containerNs, err := netns.GetFromPath(containerNsPath)
 	if err != nil {
 		return err
@@ -279,7 +288,9 @@ func applyVRFConfig(containerNsPath string, ifName string, vrfConfig *apis.VRFCo
 			LinkAttrs: netlink.LinkAttrs{Name: vrfName},
 			Table:     vrfTable,
 		}
-		if err := nhNs.LinkAdd(vrfReq); err != nil {
+		// Devices attach in parallel and may share the VRF: the first one to
+		// get here creates it, the others find it.
+		if err := nhNs.LinkAdd(vrfReq); err != nil && !errors.Is(err, syscall.EEXIST) {
 			return 0, fmt.Errorf("failed to add vrf %s: %w", vrfName, err)
 		}
 		vrfLink, err = nhNs.LinkByName(vrfName)
