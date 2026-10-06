@@ -378,6 +378,55 @@ func benchmarkAttachManyDevices(b *testing.B) {
 			}
 		})
 
+		b.Run(fmt.Sprintf("%dNICs_PreDownAndSharedHandle", numDevices), func(b *testing.B) {
+			var attachDur time.Duration
+			var n int
+			for b.Loop() {
+				b.StopTimer()
+				for i := range numDevices {
+					l, err := nlwrap.LinkByName(fmt.Sprintf("bmany%d", i))
+					if err != nil {
+						b.Fatal(err)
+					}
+					if err := netlink.LinkSetDown(l); err != nil {
+						b.Fatal(err)
+					}
+				}
+				b.StartTimer()
+
+				n++
+				t0 := time.Now()
+				nsHandle := newPodNetnsHandle(containerNsPath)
+				for i := range numDevices {
+					cfg := deviceConfig(i)
+					data, nsLink, err := nsAttachNetdevWithHandle(nsHandle, cfg.NetworkInterfaceConfigInHost.Interface.Name, cfg.NetworkInterfaceConfigInPod.Interface)
+					if err != nil {
+						nsHandle.Close()
+						b.Fatal(err)
+					}
+					if err := configureNetdevInNSWithHandle(context.Background(), containerNsPath, nsHandle, nsLink, fmt.Sprintf("dev%d", i), cfg, data.InterfaceName, resourceapply.AllocatedDeviceStatus()); err != nil {
+						nsHandle.Close()
+						b.Fatal(err)
+					}
+				}
+				nsHandle.Close()
+				attachDur += time.Since(t0)
+
+				b.StopTimer()
+				for i := range numDevices {
+					if err := nsDetachNetdev(containerNsPath, fmt.Sprintf("dranet%d", i), fmt.Sprintf("bmany%d", i)); err != nil {
+						b.Fatal(err)
+					}
+				}
+				b.StartTimer()
+			}
+			if n > 0 {
+				msTotal := float64(attachDur.Milliseconds()) / float64(n)
+				b.ReportMetric(msTotal, "ms/attach-all")
+				b.ReportMetric(msTotal/float64(numDevices), "ms/nic")
+			}
+		})
+
 		for i := range numDevices {
 			if l, err := nlwrap.LinkByName(fmt.Sprintf("bmany%d", i)); err == nil {
 				_ = netlink.LinkDel(l)

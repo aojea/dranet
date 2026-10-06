@@ -56,6 +56,14 @@ func applyRoutingConfig(containerNsPAth string, ifName string, routeConfig []api
 	if err != nil {
 		return fmt.Errorf("link not found for interface %s on namespace %s: %w", ifName, containerNsPAth, err)
 	}
+	return applyRoutingConfigWithHandle(containerNsPAth, nhNs, nsLink, routeConfig, vrfTable)
+}
+
+func applyRoutingConfigWithHandle(containerNsPAth string, nhNs nlwrap.Handle, nsLink netlink.Link, routeConfig []apis.RouteConfig, vrfTable int) error {
+	if len(routeConfig) == 0 {
+		return nil
+	}
+	ifName := nsLink.Attrs().Name
 
 	errorList := []error{}
 	// Sort routes to process link-local routes before universe routes.
@@ -127,6 +135,14 @@ func applyNeighborConfig(containerNsPAth string, ifName string, neighConfig []ap
 	if err != nil {
 		return fmt.Errorf("link not found for interface %s on namespace %s: %w", ifName, containerNsPAth, err)
 	}
+	return applyNeighborConfigWithHandle(nhNs, nsLink, neighConfig)
+}
+
+func applyNeighborConfigWithHandle(nhNs nlwrap.Handle, nsLink netlink.Link, neighConfig []apis.NeighborConfig) error {
+	if len(neighConfig) == 0 {
+		return nil
+	}
+	ifName := nsLink.Attrs().Name
 
 	var errorList []error
 	for _, neigh := range neighConfig {
@@ -168,6 +184,14 @@ func applyRulesConfig(containerNsPath string, rulesConfig []apis.RuleConfig) err
 		return fmt.Errorf("could not get netlink handle: %v", err)
 	}
 	defer nsHandle.Close()
+
+	return applyRulesConfigWithHandle(containerNsPath, nsHandle, rulesConfig)
+}
+
+func applyRulesConfigWithHandle(containerNsPath string, nsHandle nlwrap.Handle, rulesConfig []apis.RuleConfig) error {
+	if len(rulesConfig) == 0 {
+		return nil
+	}
 
 	errorList := []error{}
 	for _, ruleCfg := range rulesConfig {
@@ -278,7 +302,21 @@ func applyVRFConfig(containerNsPath string, ifName string, vrfConfig *apis.VRFCo
 	if err != nil {
 		return 0, fmt.Errorf("link not found for interface %s on namespace %s: %w", ifName, containerNsPath, err)
 	}
+	return applyVRFConfigWithHandle(containerNs, nhNs, nsLink, vrfConfig)
+}
 
+func applyVRFConfigWithHandle(containerNs netns.NsHandle, nhNs nlwrap.Handle, nsLink netlink.Link, vrfConfig *apis.VRFConfig) (int, error) {
+	if vrfConfig == nil {
+		return 0, fmt.Errorf("vrf config is nil")
+	}
+	if vrfConfig.Name == "" {
+		return 0, fmt.Errorf("vrf name not specified")
+	}
+	if vrfConfig.Table == nil {
+		return 0, fmt.Errorf("vrf table not specified")
+	}
+
+	ifName := nsLink.Attrs().Name
 	vrfName := vrfConfig.Name
 	vrfTable := uint32(*vrfConfig.Table)
 
