@@ -462,3 +462,40 @@ func TestPCIAddressForRDMADevice(t *testing.T) {
 		}
 	})
 }
+
+func TestRDMAPortLinkLayers(t *testing.T) {
+	dir := t.TempDir()
+	for port, layer := range map[string]string{
+		"rocep231s0/ports/1": "Ethernet\n",
+		"mlx5_0/ports/1":     "InfiniBand\n",
+		// A VPI adapter whose first port is InfiniBand and second Ethernet.
+		"mlx4_0/ports/1": "InfiniBand\n",
+		"mlx4_0/ports/2": "Ethernet\n",
+	} {
+		if err := os.MkdirAll(filepath.Join(dir, port), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, port, "link_layer"), []byte(layer), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "noports"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	testCases := []struct {
+		device string
+		want   []string
+	}{
+		{device: "rocep231s0", want: []string{"Ethernet"}},
+		{device: "mlx5_0", want: []string{"InfiniBand"}},
+		{device: "mlx4_0", want: []string{"InfiniBand", "Ethernet"}},
+		{device: "noports", want: nil},
+		{device: "absent", want: nil},
+	}
+	for _, tc := range testCases {
+		if diff := cmp.Diff(tc.want, rdmaPortLinkLayers(dir, tc.device)); diff != "" {
+			t.Errorf("rdmaPortLinkLayers(%q) mismatch (-want +got):\n%s", tc.device, diff)
+		}
+	}
+}

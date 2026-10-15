@@ -531,7 +531,7 @@ func TestProviderIdentifiers(t *testing.T) {
 				}
 			}}
 			db := New(WithCloudInstance(provider), WithProfileProvider(provider))
-			db.updateDeviceStore([]resourceapi.Device{device})
+			db.updateDeviceStore(hostDevices(device))
 			claim := &resourceapi.ResourceClaim{}
 			claim.UID = "claim-1"
 			config := &apis.NetworkConfig{Profile: "test-profile"}
@@ -694,8 +694,11 @@ func TestAddPCIAttributes(t *testing.T) {
 			},
 		}
 		db := &DB{}
-		result := db.addPCIAttributes(devices, pciInfo)
+		result := db.addPCIAttributes(hostDevices(devices...), pciInfo)
 
+		if result[0].pciClass != pciBaseClassNetwork {
+			t.Errorf("pciClass = %q, want %q", result[0].pciClass, pciBaseClassNetwork)
+		}
 		if v, ok := result[0].Attributes[apis.AttrNUMANode]; !ok || v.IntValue == nil || *v.IntValue != 0 {
 			t.Errorf("AttrNUMANode not set from ghw, got: %v", v)
 		}
@@ -730,7 +733,7 @@ func TestAddPCIAttributes(t *testing.T) {
 			},
 		}
 		db := &DB{}
-		result := db.addPCIAttributes(devices, longPCIInfo)
+		result := db.addPCIAttributes(hostDevices(devices...), longPCIInfo)
 
 		v, ok := result[0].Attributes[apis.AttrPCIDevice]
 		if !ok || v.StringValue == nil {
@@ -764,7 +767,7 @@ func TestAddPCIAttributes(t *testing.T) {
 			},
 		}
 		db := &DB{}
-		result := db.addPCIAttributes(devices, longPCIInfo)
+		result := db.addPCIAttributes(hostDevices(devices...), longPCIInfo)
 
 		v, ok := result[0].Attributes[apis.AttrPCIVendor]
 		if !ok || v.StringValue == nil {
@@ -789,7 +792,7 @@ func TestAddPCIAttributes(t *testing.T) {
 			},
 		}
 		db := &DB{}
-		result := db.addPCIAttributes(devices, pciInfo)
+		result := db.addPCIAttributes(hostDevices(devices...), pciInfo)
 
 		if v, ok := result[0].Attributes[apis.AttrNUMANode]; !ok || v.IntValue == nil || *v.IntValue != 99 {
 			t.Errorf("AttrNUMANode overwritten, expected 99, got: %v", v)
@@ -804,7 +807,7 @@ func TestAddPCIAttributes(t *testing.T) {
 			},
 		}
 		db := &DB{}
-		result := db.addPCIAttributes(devices, pciInfo)
+		result := db.addPCIAttributes(hostDevices(devices...), pciInfo)
 
 		if len(result[0].Attributes) != 0 {
 			t.Errorf("expected no attributes added for non-PCI device, got: %v", result[0].Attributes)
@@ -821,7 +824,7 @@ func TestAddPCIAttributes(t *testing.T) {
 			},
 		}
 		db := &DB{}
-		_ = db.addPCIAttributes(devices, nil)
+		_ = db.addPCIAttributes(hostDevices(devices...), nil)
 	})
 
 	t.Run("publishes standardized scalar NUMA attribute by default", func(t *testing.T) {
@@ -837,7 +840,7 @@ func TestAddPCIAttributes(t *testing.T) {
 			deviceAttributeMachineModifiers: []deviceattribute.MachineModifier{deviceattribute.WithFSFromRoot(root)},
 		}
 
-		result := db.addPCIAttributes(devices, pciInfo)
+		result := db.addPCIAttributes(hostDevices(devices...), pciInfo)
 		got, ok := result[0].Attributes[deviceattribute.StandardDeviceAttributeNUMANode]
 		if !ok || got.IntValue == nil || *got.IntValue != 0 {
 			t.Fatalf("standardized NUMA attribute = %v, want scalar 0", got)
@@ -864,7 +867,7 @@ func TestAddPCIAttributes(t *testing.T) {
 			},
 		}
 
-		result := db.addPCIAttributes(devices, pciInfo)
+		result := db.addPCIAttributes(hostDevices(devices...), pciInfo)
 		got, ok := result[0].Attributes[deviceattribute.StandardDeviceAttributeNUMANode]
 		if !ok {
 			t.Fatal("standardized NUMA attribute was not published")
@@ -890,7 +893,7 @@ func TestAddPCIAttributes(t *testing.T) {
 			deviceAttributeMachineModifiers: []deviceattribute.MachineModifier{deviceattribute.WithFSFromRoot(root)},
 		}
 
-		result := db.addPCIAttributes(devices, nil)
+		result := db.addPCIAttributes(hostDevices(devices...), nil)
 		got, ok := result[0].Attributes[deviceattribute.StandardDeviceAttributeNUMANode]
 		if !ok || got.IntValue == nil || *got.IntValue != 2 {
 			t.Fatalf("standardized NUMA attribute = %v, want scalar 2", got)
@@ -912,6 +915,15 @@ func writeTestSysfsFile(t *testing.T, root, name, contents string) {
 	}
 }
 
+// hostDevices wraps published Devices as the scan pipeline sees them.
+func hostDevices(devices ...resourceapi.Device) []hostDevice {
+	wrapped := make([]hostDevice, 0, len(devices))
+	for _, device := range devices {
+		wrapped = append(wrapped, hostDevice{Device: device})
+	}
+	return wrapped
+}
+
 func TestAddRDMAAttributesStandalone(t *testing.T) {
 	t.Run("uses existing AttrRDMADevice without rdmamap lookup", func(t *testing.T) {
 		devices := []resourceapi.Device{
@@ -924,7 +936,7 @@ func TestAddRDMAAttributesStandalone(t *testing.T) {
 			},
 		}
 		db := &DB{}
-		result := db.addRDMAAttributes(devices)
+		result := db.addRDMAAttributes(hostDevices(devices...))
 
 		if v, ok := result[0].Attributes[apis.AttrRDMA]; !ok || v.BoolValue == nil || !*v.BoolValue {
 			t.Errorf("AttrRDMA = %v, want true", v)
@@ -948,7 +960,7 @@ func TestAddRDMAAttributesStandalone(t *testing.T) {
 			},
 		}
 		db := &DB{}
-		result := db.addRDMAAttributes(devices)
+		result := db.addRDMAAttributes(hostDevices(devices...))
 
 		if v, ok := result[0].Attributes[apis.AttrRDMA]; !ok || v.BoolValue == nil || !*v.BoolValue {
 			t.Errorf("AttrRDMA = %v, want true", v)
@@ -971,7 +983,7 @@ func TestAddRDMAAttributesStandalone(t *testing.T) {
 			},
 		}
 		db := &DB{}
-		result := db.addRDMAAttributes(devices)
+		result := db.addRDMAAttributes(hostDevices(devices...))
 
 		if v, ok := result[0].Attributes[apis.AttrRDMA]; !ok || v.BoolValue == nil || *v.BoolValue {
 			t.Errorf("AttrRDMA = %v, want false", v)
@@ -980,4 +992,119 @@ func TestAddRDMAAttributesStandalone(t *testing.T) {
 			t.Errorf("AttrRDMADevice should not be set for a non-RDMA netdev")
 		}
 	})
+}
+
+func TestIsIBOnlyDevice(t *testing.T) {
+	rdma := func(name string) resourceapi.DeviceAttribute {
+		return resourceapi.DeviceAttribute{StringValue: ptr.To(name)}
+	}
+
+	testCases := []struct {
+		name   string
+		device hostDevice
+		want   bool
+	}{
+		{
+			name: "RoCE NIC whose netdev is in a pod namespace is not IB-only",
+			device: hostDevice{
+				Device:         resourceapi.Device{Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{apis.AttrRDMADevice: rdma("rocep231s0")}},
+				pciClass:       pciBaseClassNetwork,
+				rdmaLinkLayers: []string{"Ethernet"},
+			},
+			want: false,
+		},
+		{
+			name: "RoCE NIC with its netdev on the host is not IB-only",
+			device: hostDevice{
+				Device: resourceapi.Device{Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+					apis.AttrRDMADevice:    rdma("rocep231s0"),
+					apis.AttrInterfaceName: {StringValue: ptr.To("enp231s0")},
+				}},
+				pciClass:       pciBaseClassNetwork,
+				rdmaLinkLayers: []string{"Ethernet"},
+			},
+			want: false,
+		},
+		{
+			name: "IB HCA with IPoIB skipped is IB-only",
+			device: hostDevice{
+				Device:         resourceapi.Device{Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{apis.AttrRDMADevice: rdma("mlx5_0")}},
+				pciClass:       pciBaseClassNetwork,
+				rdmaLinkLayers: []string{"InfiniBand"},
+			},
+			want: true,
+		},
+		{
+			name: "VPI adapter with an Ethernet second port in a pod namespace is not IB-only",
+			device: hostDevice{
+				Device:         resourceapi.Device{Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{apis.AttrRDMADevice: rdma("mlx4_0")}},
+				pciClass:       pciBaseClassNetwork,
+				rdmaLinkLayers: []string{"InfiniBand", "Ethernet"},
+			},
+			want: false,
+		},
+		{
+			name: "eRDMA is IB-only although its link layer is Ethernet",
+			device: hostDevice{
+				Device:         resourceapi.Device{Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{apis.AttrRDMADevice: rdma("erdma_0")}},
+				pciClass:       "00",
+				rdmaLinkLayers: []string{"Ethernet"},
+			},
+			want: true,
+		},
+		{
+			name: "EFA reports an unknown link layer and is IB-only",
+			device: hostDevice{
+				Device:         resourceapi.Device{Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{apis.AttrRDMADevice: rdma("rdmap0s6")}},
+				pciClass:       pciBaseClassNetwork,
+				rdmaLinkLayers: []string{"Unknown"},
+			},
+			want: true,
+		},
+		{
+			name: "RDMA device whose sysfs could not be read keeps the attribute-only verdict",
+			device: hostDevice{
+				Device: resourceapi.Device{Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{apis.AttrRDMADevice: rdma("mlx5_0")}},
+			},
+			want: true,
+		},
+		{
+			name: "device without RDMA capability is not IB-only",
+			device: hostDevice{
+				Device:   resourceapi.Device{Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{apis.AttrPCIAddress: {StringValue: ptr.To("0000:e7:00.0")}}},
+				pciClass: pciBaseClassNetwork,
+			},
+			want: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			db := &DB{deviceStore: map[string]hostDevice{"dev": tc.device}}
+			if got := db.IsIBOnlyDevice("dev"); got != tc.want {
+				t.Errorf("IsIBOnlyDevice() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	t.Run("unknown device is not IB-only", func(t *testing.T) {
+		if (&DB{}).IsIBOnlyDevice("absent") {
+			t.Error("IsIBOnlyDevice() = true for a device that is not in the store")
+		}
+	})
+}
+
+func TestGetDeviceReturnsPublishedDevice(t *testing.T) {
+	db := &DB{deviceStore: map[string]hostDevice{"dev": {
+		Device:         resourceapi.Device{Name: "dev"},
+		pciClass:       pciBaseClassNetwork,
+		rdmaLinkLayers: []string{"Ethernet"},
+	}}}
+	got, ok := db.GetDevice("dev")
+	if !ok {
+		t.Fatal("GetDevice() did not find the device")
+	}
+	if diff := cmp.Diff(resourceapi.Device{Name: "dev"}, got); diff != "" {
+		t.Errorf("GetDevice() mismatch (-want +got):\n%s", diff)
+	}
 }

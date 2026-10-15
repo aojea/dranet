@@ -273,7 +273,40 @@ func pciAddressForNetInterface(ifName string) (*pciAddress, error) {
 	return address, nil
 }
 
-const sysInfinibandPath = "/sys/class/infiniband/"
+const (
+	sysInfinibandPath = "/sys/class/infiniband/"
+	// linkLayerEthernet is what an RDMA device reports when its transport rides
+	// a netdev (RoCE, iWARP). A real InfiniBand port reports "InfiniBand".
+	linkLayerEthernet = "Ethernet"
+	// pciBaseClassNetwork is the PCI base class of a network controller.
+	// https://pcisig.com/sites/default/files/files/PCI_Code-ID_r_1_11__v24_Jan_2019.pdf
+	pciBaseClassNetwork = "02"
+)
+
+// rdmaPortLinkLayers returns the link layer of every port of an RDMA device,
+// in port order, nil when its ports cannot be listed. basePath is a directory
+// holding RDMA devices, such as /sys/class/infiniband or a PCI device's
+// infiniband/ directory. Link layers are per port: a VPI adapter (mlx4) can
+// run port 1 as InfiniBand and port 2 as Ethernet.
+func rdmaPortLinkLayers(basePath, rdmaDevName string) []string {
+	portsDir := filepath.Join(basePath, rdmaDevName, "ports")
+	ports, err := os.ReadDir(portsDir)
+	if err != nil {
+		klog.V(4).Infof("Could not list ports of RDMA device %s: %v", rdmaDevName, err)
+		return nil
+	}
+	var layers []string
+	for _, port := range ports {
+		body, err := os.ReadFile(filepath.Join(portsDir, port.Name(), "link_layer"))
+		if err != nil {
+			continue
+		}
+		if layer := strings.TrimSpace(string(body)); layer != "" {
+			layers = append(layers, layer)
+		}
+	}
+	return layers
+}
 
 // pciAddressForRDMADevice resolves the PCI address for an RDMA device by
 // following the sysfs device symlink. For example, /sys/class/infiniband/erdma_0/device

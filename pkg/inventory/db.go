@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"maps"
 	"net"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -78,9 +79,9 @@ type DB struct {
 	mu sync.RWMutex
 	// deviceStore is an in-memory cache of the available devices on the node.
 	// It is keyed by the normalized PCI address of the device. The value is a
-	// resourceapi.Device object that contains the device's attributes.
+	// hostDevice that contains the device's attributes and node-local facts.
 	// The deviceStore is periodically updated by the Run method.
-	deviceStore map[string]resourceapi.Device
+	deviceStore map[string]hostDevice
 	// deviceConfigStore caches cloud-provider network configuration per device.
 	// This helps us avoid repeatedly querying the provider APIs. Keyed by device name.
 	deviceConfigStore map[string]*apis.NetworkConfig
@@ -105,6 +106,30 @@ type DB struct {
 	// deviceAttributeMachineModifiers is used to redirect the upstream
 	// topology helpers to a synthetic sysfs in unit tests.
 	deviceAttributeMachineModifiers []deviceattribute.MachineModifier
+}
+
+// hostDevice is the published Device plus node-local facts the driver needs
+// that are not part of the ResourceSlice. Only the embedded Device leaves
+// this package.
+type hostDevice struct {
+	resourceapi.Device
+	// pciClass is the PCI base class, pciBaseClassNetwork for a network
+	// controller. Empty when the device is not a PCI device or ghw did not
+	// report it.
+	pciClass string
+	// rdmaLinkLayers is the link layer of every port of the device's RDMA
+	// device, in port order. Nil when the device has no RDMA device.
+	rdmaLinkLayers []string
+}
+
+// publishedDevices projects hostDevices to the Devices published in the
+// ResourceSlice.
+func publishedDevices(devices []hostDevice) []resourceapi.Device {
+	published := make([]resourceapi.Device, 0, len(devices))
+	for _, device := range devices {
+		published = append(published, device.Device)
+	}
+	return published
 }
 
 type Option func(*DB)
@@ -151,7 +176,7 @@ func WithProfileProvider(profProv cloudprovider.ProfileProvider) Option {
 func New(opts ...Option) *DB {
 	db := &DB{
 
-		deviceStore:       map[string]resourceapi.Device{},
+		deviceStore:       map[string]hostDevice{},
 		deviceConfigStore: map[string]*apis.NetworkConfig{},
 		rateLimiter:       rate.NewLimiter(rate.Every(defaultMinPollInterval), defaultPollBurst),
 		notifications:     make(chan []resourceapi.Device),
@@ -232,7 +257,7 @@ func (db *DB) scan() []resourceapi.Device {
 	devices = db.addCloudAttributes(devices)
 
 	// Remove default interface.
-	filteredDevices := []resourceapi.Device{}
+	filteredDevices := []hostDevice{}
 	for _, device := range devices {
 		ifName := device.Attributes[apis.AttrInterfaceName].StringValue
 		if ifName != nil && db.gwInterfaces.Has(string(*ifName)) {
@@ -248,7 +273,7 @@ func (db *DB) scan() []resourceapi.Device {
 
 	klog.V(4).Infof("Found %d devices", len(filteredDevices))
 	db.updateDeviceStore(filteredDevices)
-	return filteredDevices
+	return publishedDevices(filteredDevices)
 }
 
 func (db *DB) GetResources(ctx context.Context) <-chan []resourceapi.Device {
@@ -266,8 +291,8 @@ func (db *DB) RequestRescan() {
 	}
 }
 
-func (db *DB) discoverPCIDevices(pciInfo *ghw.PCIInfo) []resourceapi.Device {
-	devices := []resourceapi.Device{}
+func (db *DB) discoverPCIDevices(pciInfo *ghw.PCIInfo) []hostDevice {
+	devices := []hostDevice{}
 
 	if pciInfo == nil {
 		return devices
@@ -281,11 +306,11 @@ func (db *DB) discoverPCIDevices(pciInfo *ghw.PCIInfo) []resourceapi.Device {
 			klog.Warningf("PCI network device %s is bound to driver %q which does not provide a netdev; not publishing it", pciDev.Address, pciDev.Driver)
 			continue
 		}
-		device := resourceapi.Device{
+		device := hostDevice{Device: resourceapi.Device{
 			Name:       names.NormalizePCIAddress(pciDev.Address),
 			Attributes: make(map[resourceapi.QualifiedName]resourceapi.DeviceAttribute),
 			Capacity:   make(map[resourceapi.QualifiedName]resourceapi.DeviceCapacity),
-		}
+		}}
 		device.Attributes[apis.AttrPCIAddress] = resourceapi.DeviceAttribute{StringValue: &pciDev.Address}
 		devices = append(devices, device)
 	}
@@ -300,19 +325,19 @@ func (db *DB) discoverPCIDevices(pciInfo *ghw.PCIInfo) []resourceapi.Device {
 //     network interface.
 //   - For Network interfaces which are not associated with a PCI Device (like
 //     virtual interfaces), they are added as their own device.
-func (db *DB) discoverNetworkInterfaces(pciDevices []resourceapi.Device) []resourceapi.Device {
+func (db *DB) discoverNetworkInterfaces(pciDevices []hostDevice) []hostDevice {
 	links, err := nlwrap.LinkList()
 	if err != nil {
 		klog.Errorf("Could not list network interfaces: %v", err)
 		return pciDevices
 	}
 
-	pciDeviceMap := make(map[string]*resourceapi.Device)
+	pciDeviceMap := make(map[string]*hostDevice)
 	for i := range pciDevices {
 		pciDeviceMap[pciDevices[i].Name] = &pciDevices[i]
 	}
 
-	otherDevices := []resourceapi.Device{}
+	otherDevices := []hostDevice{}
 
 	for _, link := range links {
 		ifName := link.Attrs().Name
@@ -351,7 +376,7 @@ func (db *DB) discoverNetworkInterfaces(pciDevices []resourceapi.Device) []resou
 				klog.Errorf("Network interface %s has PCI address %q, but it was not found in initial PCI scan.", ifName, pciAddr)
 				continue
 			}
-			addLinkAttributes(device, link)
+			addLinkAttributes(&device.Device, link)
 		} else {
 			// Not a PCI device.
 
@@ -367,7 +392,7 @@ func (db *DB) discoverNetworkInterfaces(pciDevices []resourceapi.Device) []resou
 				Attributes: make(map[resourceapi.QualifiedName]resourceapi.DeviceAttribute),
 			}
 			addLinkAttributes(newDevice, link)
-			otherDevices = append(otherDevices, *newDevice)
+			otherDevices = append(otherDevices, hostDevice{Device: *newDevice})
 		}
 	}
 
@@ -496,7 +521,7 @@ func addLinkAttributes(device *resourceapi.Device, link netlink.Link) {
 	}
 }
 
-func (db *DB) addRDMAAttributes(devices []resourceapi.Device) []resourceapi.Device {
+func (db *DB) addRDMAAttributes(devices []hostDevice) []hostDevice {
 	for i := range devices {
 		isRDMA := false
 		if ifName := devices[i].Attributes[apis.AttrInterfaceName].StringValue; ifName != nil && *ifName != "" {
@@ -524,14 +549,17 @@ func (db *DB) addRDMAAttributes(devices []resourceapi.Device) []resourceapi.Devi
 			}
 		}
 		devices[i].Attributes[apis.AttrRDMA] = resourceapi.DeviceAttribute{BoolValue: &isRDMA}
+		if isRDMA {
+			devices[i].rdmaLinkLayers = rdmaPortLinkLayers(sysInfinibandPath, *devices[i].Attributes[apis.AttrRDMADevice].StringValue)
+		}
 	}
 	return devices
 }
 
-func (db *DB) addCloudAttributes(devices []resourceapi.Device) []resourceapi.Device {
+func (db *DB) addCloudAttributes(devices []hostDevice) []hostDevice {
 	for i := range devices {
 		device := &devices[i]
-		maps.Copy(device.Attributes, db.getProviderAttributes(device, db.instance))
+		maps.Copy(device.Attributes, db.getProviderAttributes(&device.Device, db.instance))
 	}
 	return devices
 }
@@ -574,8 +602,8 @@ func (db *DB) getProviderAttributes(device *resourceapi.Device, instance cloudpr
 	return instance.GetDeviceAttributes(id)
 }
 
-func (db *DB) updateDeviceStore(devices []resourceapi.Device) {
-	deviceStore := map[string]resourceapi.Device{}
+func (db *DB) updateDeviceStore(devices []hostDevice) {
+	deviceStore := map[string]hostDevice{}
 	deviceConfigStore := map[string]*apis.NetworkConfig{}
 
 	for _, device := range devices {
@@ -583,7 +611,7 @@ func (db *DB) updateDeviceStore(devices []resourceapi.Device) {
 
 		// Cache the configuration if the provider returns one.
 		if db.instance != nil {
-			id := getDeviceIdentifiers(&device)
+			id := getDeviceIdentifiers(&device.Device)
 
 			if conf := db.instance.GetDeviceConfig(id); conf != nil {
 				// A provider-advertised profile is only honored when a profile
@@ -609,7 +637,7 @@ func (db *DB) GetDevice(deviceName string) (resourceapi.Device, bool) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 	device, exists := db.deviceStore[deviceName]
-	return device, exists
+	return device.Device, exists
 }
 
 func (db *DB) getProfileProvider() cloudprovider.ProfileProvider {
@@ -631,7 +659,7 @@ func (db *DB) GetProfileConfig(deviceName string, claim *resourceapi.ResourceCla
 		return nil, fmt.Errorf("device %s not found in inventory", deviceName)
 	}
 
-	id := getDeviceIdentifiers(&device)
+	id := getDeviceIdentifiers(&device.Device)
 
 	return p.GetProfileConfig(id, claim, config)
 }
@@ -651,7 +679,7 @@ func (db *DB) ReleaseProfileConfig(deviceName string, claimUID types.UID, config
 	if exists {
 		// Device might have been removed from the node during teardown,
 		// but we populate identifiers if we still have them to aid cleanup.
-		id = getDeviceIdentifiers(&device)
+		id = getDeviceIdentifiers(&device.Device)
 	}
 
 	return p.ReleaseProfileConfig(id, claimUID, config)
@@ -696,18 +724,31 @@ func (db *DB) getNetInterfaceNameWithoutRescan(deviceName string) (string, error
 	return *device.Attributes[apis.AttrInterfaceName].StringValue, nil
 }
 
-// IsIBOnlyDevice returns true if the device has RDMA capability but no netdev
-// interface (i.e. an InfiniBand-only device). Derived from existing attributes:
-// a device with a non-empty rdmaDevice and no ifName is IB-only.
+// IsIBOnlyDevice returns true if the device has RDMA capability and no netdev
+// of its own (i.e. an InfiniBand-only device).
+//
+// An absent ifName alone does not prove that: /sys/class/net is netns-tagged,
+// so a RoCE NIC loses its ifName for as long as its netdev sits in a pod's
+// namespace (the same trap isAllocatableNetworkDevice describes). The scan
+// records two facts that do not depend on where the netdev currently is: the
+// PCI base class and the link layers of the RDMA device's ports. A network
+// controller with an Ethernet RDMA port owns a netdev somewhere, so it is not
+// IB-only. Anything that is not a network controller (eRDMA) has no netdev.
 func (db *DB) IsIBOnlyDevice(deviceName string) bool {
-	device, exists := db.GetDevice(deviceName)
+	db.mu.RLock()
+	device, exists := db.deviceStore[deviceName]
+	db.mu.RUnlock()
 	if !exists {
 		return false
 	}
 	rdmaAttr := device.Attributes[apis.AttrRDMADevice]
-	ifAttr := device.Attributes[apis.AttrInterfaceName]
-	return rdmaAttr.StringValue != nil && *rdmaAttr.StringValue != "" &&
-		(ifAttr.StringValue == nil || *ifAttr.StringValue == "")
+	if rdmaAttr.StringValue == nil || *rdmaAttr.StringValue == "" {
+		return false
+	}
+	if ifAttr := device.Attributes[apis.AttrInterfaceName]; ifAttr.StringValue != nil && *ifAttr.StringValue != "" {
+		return false
+	}
+	return device.pciClass != pciBaseClassNetwork || !slices.Contains(device.rdmaLinkLayers, linkLayerEthernet)
 }
 
 // GetRDMADeviceName returns the RDMA link name (e.g. "mlx5_0") for an IB-only
@@ -728,7 +769,7 @@ func (db *DB) GetRDMADeviceName(deviceName string) (string, error) {
 // isNetworkDevice checks the class is 0x2, defined for all types of network controllers
 // https://pcisig.com/sites/default/files/files/PCI_Code-ID_r_1_11__v24_Jan_2019.pdf
 func isNetworkDevice(dev *ghw.PCIDevice) bool {
-	return dev.Class.ID == "02"
+	return dev.Class.ID == pciBaseClassNetwork
 }
 
 // isAllocatableNetworkDevice reports whether dranet can ever prepare this
@@ -769,10 +810,10 @@ func isAllocatableNetworkDevice(dev *ghw.PCIDevice) bool {
 // attributes like NUMA node, vendor, and product are populated uniformly by
 // enrichPCIDeviceAttributes in the enrichment phase.
 //
-// Unlike /sys/class/net, /sys/class/infiniband entries are not netns-tagged:
-// they remain visible from the host even after the device is allocated to a pod,
-// so this scan is stable across the full device lifecycle.
-func (db *DB) discoverStandaloneRDMADevices(devices []resourceapi.Device) []resourceapi.Device {
+// Like /sys/class/net, /sys/class/infiniband is netns-tagged, but in the
+// default shared RDMA netns mode an RDMA device stays bound to the host
+// namespace, so this scan is stable across the full device lifecycle.
+func (db *DB) discoverStandaloneRDMADevices(devices []hostDevice) []hostDevice {
 	knownPCIAddresses := sets.New[string]()
 	for _, device := range devices {
 		if pciAttr, ok := device.Attributes[apis.AttrPCIAddress]; ok && pciAttr.StringValue != nil {
@@ -793,11 +834,11 @@ func (db *DB) discoverStandaloneRDMADevices(devices []resourceapi.Device) []reso
 		}
 
 		klog.V(2).Infof("Found standalone RDMA device %s at PCI %s", rdmaDevName, pciAddr)
-		device := resourceapi.Device{
+		device := hostDevice{Device: resourceapi.Device{
 			Name:       normalizedAddr,
 			Attributes: make(map[resourceapi.QualifiedName]resourceapi.DeviceAttribute),
 			Capacity:   make(map[resourceapi.QualifiedName]resourceapi.DeviceCapacity),
-		}
+		}}
 		device.Attributes[apis.AttrPCIAddress] = resourceapi.DeviceAttribute{StringValue: ptr.To(pciAddr.String())}
 		device.Attributes[apis.AttrRDMADevice] = resourceapi.DeviceAttribute{StringValue: ptr.To(rdmaDevName)}
 
@@ -818,7 +859,7 @@ func (db *DB) discoverStandaloneRDMADevices(devices []resourceapi.Device) []reso
 // vendor/product metadata. If a device is not found in ghw (e.g., modalias
 // parsing failure), the standardized NUMA attribute can still be published
 // from its PCI address.
-func (db *DB) addPCIAttributes(devices []resourceapi.Device, pciInfo *ghw.PCIInfo) []resourceapi.Device {
+func (db *DB) addPCIAttributes(devices []hostDevice, pciInfo *ghw.PCIInfo) []hostDevice {
 	pciMap := make(map[string]*ghw.PCIDevice)
 	if pciInfo != nil {
 		for _, d := range pciInfo.Devices {
@@ -858,6 +899,9 @@ func (db *DB) addPCIAttributes(devices []resourceapi.Device, pciInfo *ghw.PCIInf
 		pciDev, inGhw := pciMap[normalizedAddr]
 		if !inGhw {
 			continue
+		}
+		if pciDev.Class != nil {
+			devices[i].pciClass = pciDev.Class.ID
 		}
 
 		if _, hasAttr := devices[i].Attributes[apis.AttrNUMANode]; !hasAttr && pciDev.Node != nil {
