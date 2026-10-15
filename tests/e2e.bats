@@ -76,6 +76,8 @@ cleanup_veth_interfaces() {
       ip link delete ipvlan-pbr-a || true
       ip link delete dhcp-cli || true
       iptables -w -D INPUT -i dhcp-srv -p udp --dport 67 -m statistic --mode nth --every 100 --packet 0 -j DROP 2>/dev/null || true
+      ip link delete slaac-cli || true
+      ip6tables -w -D INPUT -i slaac-rtr -p icmpv6 --icmpv6-type router-solicitation -m statistic --mode nth --every 100 --packet 0 -j DROP 2>/dev/null || true
     '
   done
 }
@@ -888,4 +890,46 @@ EOF
   run kubectl logs dhcp-server
   assert_success
   assert_output --partial "sending ACK"
+}
+
+@test "SLAAC ResourceClaim autoconfigures from a Router Advertisement when the router drops the first solicitation" {
+  local NODE_NAME="$CLUSTER_NAME"-worker
+  # slaac-cli goes to the Pod, slaac-rtr stays on the node with radvd.
+  docker exec "$NODE_NAME" bash -c "ip link add slaac-cli type veth peer name slaac-rtr"
+  docker exec "$NODE_NAME" bash -c "ip link set up dev slaac-rtr"
+  docker exec "$NODE_NAME" bash -c "ip link set up dev slaac-cli"
+
+  kubectl apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/radvd.yaml
+  wait_for_ready_pods app=radvd 90s
+
+  # Drop the first Router Solicitation the router receives, so only a
+  # retransmitted one gets the solicited advertisement.
+  docker exec "$NODE_NAME" bash -c "ip6tables -w -A INPUT -i slaac-rtr -p icmpv6 --icmpv6-type router-solicitation -m statistic --mode nth --every 100 --packet 0 -j DROP"
+
+  kubectl apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/deviceclass.yaml
+  kubectl apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/resourceclaim_slaac.yaml
+  wait_for_ready_pods app=pod-slaac 60s
+
+  # The address is the EUI-64 of the interface in the advertised prefix, with
+  # the prefix length of the on-link prefix. The Pod kernel derives its
+  # link-local address from the same identifier.
+  local LINK_LOCAL
+  LINK_LOCAL=$(kubectl exec pod-slaac -- ip -6 -o addr show dev eth99 scope link | awk '{print $4}')
+  local IID="${LINK_LOCAL#fe80::}"
+  IID="${IID%/64}"
+  run kubectl exec pod-slaac -- ip -6 addr show dev eth99 scope global
+  assert_success
+  assert_output --partial "inet6 2001:db8:5aac::${IID}/64"
+
+  # The default route and the more specific route go through the router's
+  # link-local address.
+  run kubectl exec pod-slaac -- ip -6 route show dev eth99
+  assert_success
+  assert_output --regexp "default via fe80::[0-9a-f:]+"
+  assert_output --regexp "2001:db8:5aac:1::/64 via fe80::[0-9a-f:]+"
+
+  # The first solicitation was dropped, so the advertisement answered a
+  # retransmission.
+  run docker exec "$NODE_NAME" bash -c "ip6tables -w -L INPUT -v -n -x | awk '/slaac-rtr/ && /statistic/ {print \$1}'"
+  assert_output "1"
 }

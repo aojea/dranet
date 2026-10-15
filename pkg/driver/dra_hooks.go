@@ -363,9 +363,13 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 		}
 	}
 
-	// If DHCP is requested, do a DHCP request to gather the network parameters (IPs and Routes)
-	// ... but we DO NOT apply them in the root namespace
-	if deviceCfg.NetworkInterfaceConfigInPod.Interface.Addressing == apis.AddressingModeDHCP {
+	// Resolve the addressing mode on the host, before the interface is handed
+	// to the Pod. A dynamic mode (DHCP, SLAAC) runs its exchange here and the
+	// result is configured statically in the Pod; nothing is applied in the
+	// root namespace.
+	podIface := &deviceCfg.NetworkInterfaceConfigInPod.Interface
+	switch podIface.Addressing {
+	case apis.AddressingModeDHCP:
 		klog.V(2).Infof("trying to get network configuration via DHCP")
 		contextCancel, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
@@ -373,26 +377,45 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 		if err != nil {
 			return fmt.Errorf("fail to get configuration via DHCP for %s: %w", ifName, err)
 		}
-		deviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses = []string{ip}
+		podIface.Addresses = []string{ip}
 		deviceCfg.NetworkInterfaceConfigInPod.Routes = append(deviceCfg.NetworkInterfaceConfigInPod.Routes, routes...)
 		if lease != nil {
 			deviceCfg.NetworkInterfaceStateInPod = &NetworkInterfaceState{DHCPLease: lease}
 		}
-	} else if !deviceCfg.NetworkInterfaceConfigInPod.Interface.IsSubinterface() && len(deviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses) == 0 {
-		// For a passthrough interface with no custom addresses and no DHCP, then use the existing ones
-		// get the existing IP addresses
-		nlAddresses, err := nlHandle.AddrList(link, netlink.FAMILY_ALL)
-		if err != nil {
-			return fmt.Errorf("fail to get ip addresses for interface %s : %w", ifName, err)
-		}
-		for _, address := range nlAddresses {
-			// Only move IP addresses with global scope because those are not host-specific, auto-configured,
-			// or have limited network scope, making them unsuitable inside the container namespace.
-			// Ref: https://www.ietf.org/rfc/rfc3549.txt
-			if address.Scope != unix.RT_SCOPE_UNIVERSE {
-				continue
+	case apis.AddressingModeSLAAC:
+		// Autoconfiguration covers IPv6 only. A passthrough interface with no
+		// IPv4 addresses in the claim keeps the host's, as it does without
+		// SLAAC; its host IPv6 addresses are replaced by the autoconfigured
+		// ones, which for an EUI-64 host are the same addresses.
+		if !podIface.IsSubinterface() && len(podIface.Addresses) == 0 {
+			hostAddresses, err := hostGlobalAddresses(nlHandle, link, netlink.FAMILY_V4)
+			if err != nil {
+				return fmt.Errorf("fail to get ip addresses for interface %s : %w", ifName, err)
 			}
-			deviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses = append(deviceCfg.NetworkInterfaceConfigInPod.Interface.Addresses, address.IPNet.String())
+			podIface.Addresses = append(podIface.Addresses, hostAddresses...)
+		}
+		id, err := slaacIdentifier(*podIface, link.Attrs().HardwareAddr)
+		if err != nil {
+			return fmt.Errorf("fail to derive the SLAAC interface identifier for %s: %w", ifName, err)
+		}
+		klog.V(2).Infof("trying to get IPv6 network configuration via SLAAC on %s", ifName)
+		slaacCtx, cancel := context.WithTimeout(ctx, slaacTimeout)
+		defer cancel()
+		addresses, routes, err := getSLAAC(slaacCtx, ifName, id)
+		if err != nil {
+			return fmt.Errorf("fail to get configuration via SLAAC for %s: %w", ifName, err)
+		}
+		podIface.Addresses = append(podIface.Addresses, addresses...)
+		deviceCfg.NetworkInterfaceConfigInPod.Routes = append(deviceCfg.NetworkInterfaceConfigInPod.Routes, routes...)
+	default:
+		// For a passthrough interface with no custom addresses, use the
+		// existing ones.
+		if !podIface.IsSubinterface() && len(podIface.Addresses) == 0 {
+			hostAddresses, err := hostGlobalAddresses(nlHandle, link, netlink.FAMILY_ALL)
+			if err != nil {
+				return fmt.Errorf("fail to get ip addresses for interface %s : %w", ifName, err)
+			}
+			podIface.Addresses = append(podIface.Addresses, hostAddresses...)
 		}
 	}
 
@@ -430,7 +453,7 @@ func (np *NetworkDriver) prepareDevice(ctx context.Context, nlHandle nlwrap.Hand
 
 	// For non-subinterface type, obtain the routes and rules associated with the interface.
 	if !deviceCfg.NetworkInterfaceConfigInPod.Interface.IsSubinterface() {
-		routes, tables, err := getRouteInfo(nlHandle, ifName, link)
+		routes, tables, err := getRouteInfo(nlHandle, ifName, link, podIface.Addressing == apis.AddressingModeSLAAC)
 		if err != nil {
 			return err
 		}
@@ -679,11 +702,35 @@ func getRuleInfo(nlHandle nlwrap.Handle) (map[int][]apis.RuleConfig, error) {
 	return rulesByTable, nil
 }
 
+// hostGlobalAddresses returns the addresses of the given family that link has
+// in the host namespace and that are suitable to move into the Pod. Only
+// addresses with global scope qualify: the others are host-specific,
+// auto-configured, or have limited network scope, making them unsuitable
+// inside the container namespace. Ref: https://www.ietf.org/rfc/rfc3549.txt
+func hostGlobalAddresses(nlHandle nlwrap.Handle, link netlink.Link, family int) ([]string, error) {
+	nlAddresses, err := nlHandle.AddrList(link, family)
+	if err != nil {
+		return nil, err
+	}
+	var addresses []string
+	for _, address := range nlAddresses {
+		if address.Scope != unix.RT_SCOPE_UNIVERSE {
+			continue
+		}
+		addresses = append(addresses, address.IPNet.String())
+	}
+	return addresses, nil
+}
+
 // getRouteInfo retrieves all routes associated with a given network interface.
 // It filters out routes that are not suitable for pod namespaces, such as
-// routes in the local table. It returns the list of suitable routes and a set
-// of the route table IDs to which they belong.
-func getRouteInfo(nlHandle nlwrap.Handle, ifName string, link netlink.Link) ([]apis.RouteConfig, sets.Set[int], error) {
+// routes in the local table. When skipRouterAdvertised is set, the IPv6 routes
+// the host learned from Router Advertisements are left out as well: the Pod
+// then gets them from the advertisement the driver solicited itself, and a
+// copy would only duplicate them under a different metric or keep a router
+// the host has since forgotten. It returns the list of suitable routes and a
+// set of the route table IDs to which they belong.
+func getRouteInfo(nlHandle nlwrap.Handle, ifName string, link netlink.Link, skipRouterAdvertised bool) ([]apis.RouteConfig, sets.Set[int], error) {
 	routes := []apis.RouteConfig{}
 	tables := sets.Set[int]{}
 	filter := &netlink.Route{
@@ -716,6 +763,10 @@ func getRouteInfo(nlHandle nlwrap.Handle, ifName string, link netlink.Link) ([]a
 			// Discard IPv6 proto=kernel routes
 			if route.Protocol == unix.RTPROT_KERNEL {
 				klog.V(5).Infof("Skipping IPv6 proto=kernel route %s for interface %s", route.String(), ifName)
+				continue
+			}
+			if skipRouterAdvertised && route.Protocol == unix.RTPROT_RA {
+				klog.V(5).Infof("Skipping IPv6 proto=ra route %s for interface %s: the Pod gets it from its own router advertisement", route.String(), ifName)
 				continue
 			}
 		}

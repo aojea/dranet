@@ -162,7 +162,7 @@ func validateInterfaceConfig(cfg *InterfaceConfig, fieldPath string) (allErrors 
 		allErrors = append(allErrors, validateSubinterfaceOnlyConfig(cfg, fieldPath)...)
 	}
 
-	if !slices.Contains([]AddressingMode{"", AddressingModeStatic, AddressingModeDHCP, AddressingModeUnnumbered}, cfg.Addressing) {
+	if !slices.Contains([]AddressingMode{"", AddressingModeStatic, AddressingModeDHCP, AddressingModeSLAAC, AddressingModeUnnumbered}, cfg.Addressing) {
 		allErrors = append(allErrors, fmt.Errorf("%s.addressing: '%s' is not supported", fieldPath, cfg.Addressing))
 	}
 
@@ -184,8 +184,16 @@ func validateInterfaceConfig(cfg *InterfaceConfig, fieldPath string) (allErrors 
 	allErrors = append(allErrors, isValidLinuxInterfaceName(cfg.Name, fieldPath+".name")...)
 
 	for i, addr := range cfg.Addresses {
-		if _, err := netip.ParsePrefix(addr); err != nil {
+		prefix, err := netip.ParsePrefix(addr)
+		if err != nil {
 			allErrors = append(allErrors, fmt.Errorf("%s.addresses[%d]: invalid IP CIDR format '%s': %w", fieldPath, i, addr, err))
+			continue
+		}
+		// SLAAC owns the IPv6 configuration of the interface; a static IPv6
+		// address next to it would either duplicate or contradict what the
+		// router advertises. IPv4 has no autoconfiguration to defer to.
+		if cfg.Addressing == AddressingModeSLAAC && prefix.Addr().Is6() {
+			allErrors = append(allErrors, fmt.Errorf("%s.addresses[%d]: IPv6 address '%s' cannot be set together with addressing '%s', which autoconfigures the IPv6 addresses", fieldPath, i, addr, AddressingModeSLAAC))
 		}
 	}
 
@@ -236,6 +244,11 @@ func validateInterfaceConfig(cfg *InterfaceConfig, fieldPath string) (allErrors 
 	// The kernel creates no IPv6 settings below this MTU, so accept_ra cannot be set.
 	if cfg.AcceptRA != nil && cfg.MTU != nil && *cfg.MTU < MinIPv6MTU {
 		allErrors = append(allErrors, fmt.Errorf("%s.acceptRA: requires an mtu of at least %d, got %d", fieldPath, MinIPv6MTU, *cfg.MTU))
+	}
+	// Nor does it keep IPv6 addresses on such an interface, so there would be
+	// nowhere to put the autoconfigured one.
+	if cfg.Addressing == AddressingModeSLAAC && cfg.MTU != nil && *cfg.MTU < MinIPv6MTU {
+		allErrors = append(allErrors, fmt.Errorf("%s.addressing: '%s' requires an mtu of at least %d, got %d", fieldPath, AddressingModeSLAAC, MinIPv6MTU, *cfg.MTU))
 	}
 
 	if cfg.VRF != nil {

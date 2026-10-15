@@ -59,7 +59,7 @@ type InterfaceConfig struct {
 	Type InterfaceType `json:"type,omitempty"`
 
 	// Addressing selects the IP address configuration strategy:
-	// "Static" (default), "DHCP", or "Unnumbered".
+	// "Static" (default), "DHCP", "SLAAC", or "Unnumbered".
 	// An empty value is treated as "Static".
 	Addressing AddressingMode `json:"addressing,omitempty"`
 
@@ -169,6 +169,14 @@ const (
 	AddressingModeStatic AddressingMode = "Static"
 	// AddressingModeDHCP obtains network configuration via DHCP.
 	AddressingModeDHCP AddressingMode = "DHCP"
+	// AddressingModeSLAAC obtains the IPv6 configuration by stateless address
+	// autoconfiguration (RFC 4862): the driver solicits a Router Advertisement
+	// on the host interface before it is handed to the Pod, and configures the
+	// autoconfigured addresses and the advertised routes statically in the Pod,
+	// the same way it does with a DHCP lease. IPv4 is not affected: a
+	// passthrough interface keeps its host IPv4 addresses, and IPv4 addresses
+	// may be set in InterfaceConfig.Addresses; IPv6 ones may not.
+	AddressingModeSLAAC AddressingMode = "SLAAC"
 	// AddressingModeUnnumbered brings the interface up without driver configuring
 	// IP addresses or routes. Valid only for subinterfaces.
 	AddressingModeUnnumbered AddressingMode = "Unnumbered"

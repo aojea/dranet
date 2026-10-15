@@ -594,6 +594,9 @@ func validateOKEProfileRequest(iface *apis.InterfaceConfig) error {
 	if iface.Addressing == apis.AddressingModeDHCP {
 		return errors.New("the OKE profile does not support DHCP addressing")
 	}
+	if iface.Addressing == apis.AddressingModeSLAAC {
+		return errors.New("the OKE profile does not support SLAAC addressing")
+	}
 	if iface.Addressing == apis.AddressingModeUnnumbered {
 		return errors.New("the OKE profile does not support unnumbered addressing")
 	}

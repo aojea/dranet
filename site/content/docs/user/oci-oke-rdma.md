@@ -27,7 +27,7 @@ The profile needs these conditions:
 - The child range is large enough for the primary VNIC subnet. See [The child range](#the-child-range).
 - No VCN subnet, pod CIDR, or service CIDR uses the child range. For each claim, the provider checks the OCA RDMA network, every VNIC subnet of the node, every host route that overlaps the child range except the default route, and the Kubernetes service address. It cannot see the whole pod CIDR or service CIDR.
 
-The profile rejects `interface.type: Passthrough`, DHCP, unnumbered addressing, and addresses in the claim. A claim with its own `routes`, `rules`, or a VRF owns the routing.
+The profile rejects `interface.type: Passthrough`, DHCP, SLAAC and unnumbered addressing, and addresses in the claim. A claim with its own `routes`, `rules`, or a VRF owns the routing.
 
 RDMA NICs on an IPv6 fabric get no profile and move into the pod as before.
 
