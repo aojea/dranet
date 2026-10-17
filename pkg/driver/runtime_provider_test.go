@@ -76,6 +76,7 @@ func newHookDriver(t *testing.T, providers ...cloudprovider.RuntimeProvider) (*N
 		eventRecorder:   record.NewFakeRecorder(10),
 		runtimeProvider: runtimeprovider.New(hookTestSocket, ocihook.DefaultTimeout, providers...),
 	}
+	np.bindRuntimeProviderPersistence()
 	np.runtimeProvider.SetIdentity(ocihook.Identity{InitPIDNamespace: true, PID: hookTestPID, Args: []string{"/dranet"}})
 	pod := &api.PodSandbox{Id: "sandbox-1", Uid: "pod-uid", Name: "workload", Namespace: "team", Linux: &api.LinuxPodSandbox{
 		Namespaces: []*api.LinuxNamespace{{Type: "network", Path: "/var/run/netns/cni-1234"}},
@@ -352,6 +353,7 @@ func TestRuntimeProviderEndToEnd(t *testing.T) {
 	provider := &fakeRuntimeProvider{}
 	np, pod := newHookDriver(t, provider)
 	WithRuntimeProvider(socket, ocihook.DefaultTimeout, provider)(np)
+	np.bindRuntimeProviderPersistence()
 	np.runtimeProvider.SetIdentity(ocihook.Identity{InitPIDNamespace: true, PID: hookTestPID, Args: []string{"/dranet"}})
 	server, err := ocihook.Listen(socket, ocihook.DefaultTimeout, np.handleRuntimeHook)
 	if err != nil {
@@ -391,5 +393,93 @@ func TestRuntimeProviderEndToEnd(t *testing.T) {
 	cancel()
 	if err := <-served; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRuntimeProviderStatePersistsAcrossDaemonRestart(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "dranet.db")
+	store1, err := NewPodConfigStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &fakeRuntimeProvider{}
+	np1, pod := newHookDriver(t, provider)
+	// Copy prepared devices into the BoltDB-backed store.
+	if origCfg, ok := np1.podConfigStore.GetPodConfig(types.UID(pod.Uid)); ok {
+		for name, devCfg := range origCfg.DeviceConfigs {
+			if err := store1.SetDeviceConfig(types.UID(pod.Uid), name, devCfg); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	np1.podConfigStore = store1
+	np1.bindRuntimeProviderPersistence()
+
+	createRuntimeHooks(t, np1, pod, &api.Container{Id: "init-1", Name: "init"})
+	if err := np1.handleRuntimeHook(context.Background(), "init-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate a daemon restart after the init container already exited (so
+	// Synchronize sees no CONTAINER_RUNNING container for this Pod).
+	store2, err := NewPodConfigStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store2.Close()
+
+	np2 := &NetworkDriver{
+		podConfigStore:  store2,
+		eventRecorder:   record.NewFakeRecorder(10),
+		runtimeProvider: runtimeprovider.New(hookTestSocket, ocihook.DefaultTimeout, provider),
+	}
+	np2.bindRuntimeProviderPersistence()
+	np2.runtimeProvider.SetIdentity(ocihook.Identity{InitPIDNamespace: true, PID: hookTestPID, Args: []string{"/dranet"}})
+	if _, err := np2.Synchronize(context.Background(), []*api.PodSandbox{pod}, []*api.Container{
+		{Id: "init-1", PodSandboxId: pod.Id, State: api.ContainerState_CONTAINER_STOPPED},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Because completion was persisted in the checkpoint, the app container
+	// created after the restart does not carry the hook or re-run the provider.
+	if hooks := createRuntimeHooks(t, np2, pod, &api.Container{Id: "app-1", Name: "app"}); len(hooks) != 0 {
+		t.Fatalf("hooks after daemon restart for already-configured sandbox = %v, want none", hooks)
+	}
+	if provider.calls() != 1 {
+		t.Fatalf("provider called %d times, want 1", provider.calls())
+	}
+
+	// Stopping the sandbox clears the persisted flag on disk too.
+	if err := np2.RemovePodSandbox(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	if err := store2.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store3, err := NewPodConfigStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store3.Close()
+	np3 := &NetworkDriver{
+		podConfigStore:  store3,
+		eventRecorder:   record.NewFakeRecorder(10),
+		runtimeProvider: runtimeprovider.New(hookTestSocket, ocihook.DefaultTimeout, provider),
+	}
+	np3.bindRuntimeProviderPersistence()
+	np3.runtimeProvider.SetIdentity(ocihook.Identity{InitPIDNamespace: true, PID: hookTestPID, Args: []string{"/dranet"}})
+	if hooks := createRuntimeHooks(t, np3, pod, &api.Container{Id: "new-sandbox-ctr", Name: "app"}); len(hooks) != 1 {
+		t.Fatalf("hooks after sandbox removal and daemon restart = %v, want 1", hooks)
+	}
+	if err := np3.handleRuntimeHook(context.Background(), "new-sandbox-ctr"); err != nil {
+		t.Fatal(err)
+	}
+	if diff := cmp.Diff(wantConfigurePodRequest(), provider.requests[1]); diff != "" {
+		t.Fatalf("request from checkpointed claims mismatch (-want +got):\n%s", diff)
 	}
 }

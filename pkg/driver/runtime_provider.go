@@ -47,7 +47,21 @@ func (np *NetworkDriver) startRuntimeProvider(ctx context.Context) error {
 	if np.runtimeProvider == nil {
 		return nil
 	}
+	np.bindRuntimeProviderPersistence()
 	return np.runtimeProvider.Start(ctx, np.handleRuntimeHook)
+}
+
+func (np *NetworkDriver) bindRuntimeProviderPersistence() {
+	if np.runtimeProvider == nil || np.podConfigStore == nil {
+		return
+	}
+	np.runtimeProvider.SetPersistence(
+		func(podUID types.UID) bool {
+			podCfg, ok := np.podConfigStore.GetPodConfig(podUID)
+			return ok && podCfg.RuntimeProviderDone
+		},
+		np.podConfigStore.SetRuntimeProviderDone,
+	)
 }
 
 func (np *NetworkDriver) resetRuntimeProvider(podUID types.UID) {
@@ -90,8 +104,10 @@ func buildConfigurePodRequest(pod *api.PodSandbox, netns string, podConfig PodCo
 		if device.Device.Name == "" {
 			device.Device.Name = config.NetworkInterfaceConfigInHost.Interface.Name
 		}
-		networkConfig := config.NetworkInterfaceConfigInPod
-		device.Config = &networkConfig
+		if config.NetworkInterfaceConfigInHost.Interface.Name != "" {
+			networkConfig := config.NetworkInterfaceConfigInPod
+			device.Config = &networkConfig
+		}
 		claim.Devices = append(claim.Devices, device)
 	}
 	claims := make([]cloudprovider.PodClaim, 0, len(byClaim))
