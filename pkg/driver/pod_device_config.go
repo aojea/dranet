@@ -49,6 +49,11 @@ type PodConfig struct {
 type DeviceConfig struct {
 	Claim types.NamespacedName `json:"claim"`
 
+	// ResourceClaim is the claim as the kubelet presented it when the device
+	// was prepared, without managedFields. It is what the provider runtime
+	// hook receives, long after the prepare call.
+	ResourceClaim *resourceapi.ResourceClaim `json:"resourceClaim,omitempty"`
+
 	// DeviceSnapshot contains the original discovered ResourceSlice Device structure,
 	// which includes the device's identifying attributes and capacity.
 	DeviceSnapshot *resourceapi.Device `json:"deviceSnapshot,omitempty"`
