@@ -77,6 +77,11 @@ var (
 		Subsystem: "driver",
 		Name:      "nri_plugin_requests_latency_seconds",
 		Help:      "NRI plugin request latency in seconds.",
+		// The runtime fails or ignores a request that exceeds its
+		// plugin_request_timeout (NRI default 2s, dranet installers set 5s).
+		// Buckets at 2 and 5 count those requests exactly, and 1.5 and 3
+		// show requests that approach either limit.
+		Buckets: []float64{0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 1.5, 2, 3, 5, 10, 30},
 	}, []string{"method", "status"})
 	publishedDevicesTotal = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: "dranet",
