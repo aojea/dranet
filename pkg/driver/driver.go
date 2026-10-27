@@ -28,6 +28,7 @@ import (
 	"sigs.k8s.io/dranet/pkg/apis"
 	"sigs.k8s.io/dranet/pkg/inventory"
 
+	"github.com/containerd/nri/pkg/api"
 	"github.com/containerd/nri/pkg/stub"
 	"sigs.k8s.io/dranet/internal/nlwrap"
 
@@ -188,6 +189,15 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 	nriOpts := []stub.Option{
 		stub.WithPluginName(driverName),
 		stub.WithPluginIdx("00"),
+		// https://github.com/containerd/nri/pull/329
+		// Fail the pod or container request if the plugin times out or
+		// loses its connection, and keep the plugin registered on timeout.
+		// Otherwise the runtime proceeds without the plugin and the pod
+		// starts without the network interfaces it requested.
+		stub.WithFailurePolicy(&api.FailurePolicy{
+			FailRequest:   true,
+			KeepConnected: true,
+		}),
 		// https://github.com/containerd/nri/pull/173
 		// Otherwise it silently exits the program
 		stub.WithOnClose(func() {
