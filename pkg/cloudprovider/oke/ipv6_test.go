@@ -513,6 +513,60 @@ func TestIPv6ProfileConfig(t *testing.T) {
 	}
 }
 
+// The driver merges what GetDeviceConfig and GetProfileConfig return into the
+// claim's config and validates the result before applying it, so the profile's
+// output must pass that validation: with the claim setting nothing, only the
+// interface, or routing of its own.
+func TestIPv6ProfileConfigMergesIntoValidConfig(t *testing.T) {
+	ipv6Fabric := &okeMetadata{RDMAFabric: &rdmaFabric{IPv6: true, Planes: 4}}
+	tests := []struct {
+		name       string
+		claim      *apis.NetworkConfig
+		wantRoutes int
+		wantRules  int
+	}{
+		{name: "claim sets nothing", claim: &apis.NetworkConfig{}, wantRoutes: 2, wantRules: 1},
+		{
+			name:       "claim names the interface",
+			claim:      &apis.NetworkConfig{Interface: apis.InterfaceConfig{Name: "rail3", Type: apis.InterfaceTypeIPVLAN}},
+			wantRoutes: 2,
+			wantRules:  1,
+		},
+		{
+			name: "claim brings its own route",
+			claim: &apis.NetworkConfig{
+				Interface: apis.InterfaceConfig{Type: apis.InterfaceTypeIPVLAN},
+				Routes:    []apis.RouteConfig{{Destination: "::/0", Gateway: testRailRouter}},
+			},
+			wantRoutes: 1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fakeSysfs(t)
+			fakeInterface(t, "rdma_vf_rail3", "0000:11:00.4", unix.ARPHRD_ETHER)
+			fakeIPv6Addresses(t, "rdma_vf_rail3", hostAddr(testRailParent, 0))
+			fakeIPv6Routers(t, map[string][]ipv6Router{"rdma_vf_rail3": {{Gateway: netip.MustParseAddr(testRailRouter), Metric: 1024}}}, 0)
+			instance := newOKEInstance(ipv6Fabric, nil)
+			id := cloudprovider.DeviceIdentifiers{Name: "rdma_vf_rail3", PCIAddress: "0000:11:00.4"}
+
+			// The order of the driver's getDeviceNetworkConfig.
+			merged := apis.MergeNetworkConfig(tt.claim, instance.GetDeviceConfig(id))
+			profile, err := instance.GetProfileConfig(id, testClaim("3f1c9b52-1d4e-4c84-9a3e-0d4d1f0c7a11"), merged)
+			if err != nil {
+				t.Fatalf("GetProfileConfig() returned error: %v", err)
+			}
+			merged = apis.MergeNetworkConfig(merged, profile)
+			if errs := merged.Validate(); len(errs) > 0 {
+				t.Fatalf("merged config is invalid: %v", errs)
+			}
+			if len(merged.Routes) != tt.wantRoutes || len(merged.Rules) != tt.wantRules {
+				t.Errorf("merged config has %d routes and %d rules, want %d and %d: %+v", len(merged.Routes), len(merged.Rules), tt.wantRoutes, tt.wantRules, merged)
+			}
+		})
+	}
+}
+
 func TestIPv6DefaultRouters(t *testing.T) {
 	gw := func(s string) net.IP { return net.ParseIP(s) }
 	_, defaultDst, _ := net.ParseCIDR("::/0")
