@@ -102,25 +102,23 @@ var hostIPv6Addresses = func(ifName string) ([]ipv6HostAddr, error) {
 }
 
 // hostIPv6DefaultRouters returns the IPv6 default routes through ifName in
-// every table. Router advertisements put them in the table of the interface's
-// VRF when it has one. Tests replace it.
-var hostIPv6DefaultRouters = func(ifName string) ([]ipv6Router, error) {
+// every table, and how many default routes on the host have a next hop it
+// cannot read (see ipv6DefaultRouters). Router advertisements put the routes in
+// the table of the interface's VRF when it has one. Tests replace it.
+var hostIPv6DefaultRouters = func(ifName string) ([]ipv6Router, int, error) {
 	link, err := nlwrap.LinkByName(ifName)
 	if err != nil {
-		return nil, fmt.Errorf("could not find interface %s: %w", ifName, err)
+		return nil, 0, fmt.Errorf("could not find interface %s: %w", ifName, err)
 	}
 	// No RT_FILTER_OIF: a multipath route has no interface of its own, only
 	// its nexthops do, and the filter would drop it.
 	filter := &netlink.Route{Table: unix.RT_TABLE_UNSPEC}
 	routes, err := nlwrap.RouteListFiltered(netlink.FAMILY_V6, filter, netlink.RT_FILTER_TABLE)
 	if err != nil {
-		return nil, fmt.Errorf("could not list the IPv6 routes of %s: %w", ifName, err)
+		return nil, 0, fmt.Errorf("could not list the IPv6 routes of %s: %w", ifName, err)
 	}
 	routers, unreadable := ipv6DefaultRouters(routes, link.Attrs().Index)
-	if len(routers) == 0 && unreadable > 0 {
-		return nil, fmt.Errorf("interface %s has no IPv6 default route the OKE profile can read; %d default route(s) on the host have neither a gateway nor an interface, as a route through a nexthop object has, which the profile does not resolve", ifName, unreadable)
-	}
-	return routers, nil
+	return routers, unreadable, nil
 }
 
 // ipv6DefaultRouters returns the gateways of the unicast default routes that
@@ -191,7 +189,8 @@ func isEthernetRailVF(ifName string) bool {
 
 // ipv6ProfileConfig resolves the OKE profile on an IPv6 RDMA fabric for the
 // Ethernet parent ifName. It returns an error, which Kubernetes retries, until
-// the parent has its autoconfigured address and default route.
+// the parent has its autoconfigured address and, unless the claim brings its
+// own routing, its default route.
 //
 // The address and the router are read once, when the claim is prepared, and
 // the child ignores router advertisements: after the fabric renumbers the
@@ -235,10 +234,6 @@ func (o *OKEInstance) ipv6ProfileConfig(ifName string, claim *resourceapi.Resour
 	if err != nil {
 		return nil, err
 	}
-	router, err := parentIPv6Router(ifName)
-	if err != nil {
-		return nil, err
-	}
 	child := childIPv6Address(prefix, claim.UID, ifName, parentAddrs)
 
 	result := &apis.NetworkConfig{
@@ -251,9 +246,14 @@ func (o *OKEInstance) ipv6ProfileConfig(ifName string, claim *resourceapi.Resour
 			AcceptRA: ptr.To[int32](0),
 		},
 	}
-	// Routing is user-owned when the claim carries routes or rules.
+	// Routing is user-owned when the claim carries routes or rules, and only
+	// the profile's own routing needs the parent's router.
 	if len(config.Routes) > 0 || len(config.Rules) > 0 {
 		return result, nil
+	}
+	router, err := parentIPv6Router(ifName)
+	if err != nil {
+		return nil, err
 	}
 	// Source routing, as on an IPv4 fabric: every RDMA NIC's default route is
 	// ::/0, so one table per RDMA NIC keeps them apart, and the rule sends the
@@ -316,12 +316,17 @@ func parentIPv6Prefix(ifName string) (netip.Prefix, []netip.Addr, error) {
 // the lowest metric first when there are several, then the lowest address: the
 // route's router preference (RFC 4191) is not read.
 func parentIPv6Router(ifName string) (netip.Addr, error) {
-	routers, err := hostIPv6DefaultRouters(ifName)
+	routers, unreadable, err := hostIPv6DefaultRouters(ifName)
 	if err != nil {
 		return netip.Addr{}, err
 	}
 	routers = slices.DeleteFunc(routers, func(r ipv6Router) bool { return !r.Gateway.Is6() })
-	if len(routers) == 0 {
+	switch {
+	case len(routers) == 0 && unreadable > 0:
+		// The unreadable routes can leave through any interface, so either
+		// cause can be the one.
+		return netip.Addr{}, fmt.Errorf("interface %s has no IPv6 default route the OKE profile can read: the rail router's advertisement may not have installed it yet, or it is one of the %d default route(s) on the host whose next hop the profile cannot read, such as a route through a nexthop object", ifName, unreadable)
+	case len(routers) == 0:
 		return netip.Addr{}, fmt.Errorf("interface %s has no IPv6 default route yet; the rail router's advertisement installs it", ifName)
 	}
 	slices.SortFunc(routers, func(a, b ipv6Router) int {

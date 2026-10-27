@@ -61,15 +61,17 @@ func hostAddr(cidr string, flags int) ipv6HostAddr {
 	return ipv6HostAddr{Prefix: netip.MustParsePrefix(cidr), Flags: flags}
 }
 
-func fakeIPv6Routers(t *testing.T, routers map[string][]ipv6Router) {
+// fakeIPv6Routers serves routers per interface and unreadable as the host's
+// count of default routes whose next hop cannot be read.
+func fakeIPv6Routers(t *testing.T, routers map[string][]ipv6Router, unreadable int) {
 	t.Helper()
 	original := hostIPv6DefaultRouters
-	hostIPv6DefaultRouters = func(ifName string) ([]ipv6Router, error) {
+	hostIPv6DefaultRouters = func(ifName string) ([]ipv6Router, int, error) {
 		r, ok := routers[ifName]
 		if !ok {
-			return nil, errors.New("no such interface")
+			return nil, 0, errors.New("no such interface")
 		}
-		return r, nil
+		return r, unreadable, nil
 	}
 	t.Cleanup(func() { hostIPv6DefaultRouters = original })
 }
@@ -236,6 +238,7 @@ func TestIPv6ProfileConfig(t *testing.T) {
 		hardwareType int
 		addresses    []ipv6HostAddr
 		routers      []ipv6Router
+		unreadable   int
 		config       *apis.NetworkConfig
 		claim        *resourceapi.ResourceClaim
 		wantChild    string
@@ -307,6 +310,23 @@ func TestIPv6ProfileConfig(t *testing.T) {
 			wantChild: railChild,
 		},
 		{
+			// Only the profile's own routing needs the parent's router.
+			name:      "user routes need no default route",
+			ifName:    "rdma_vf_rail3",
+			addresses: parent,
+			config: &apis.NetworkConfig{Profile: okeRDMAProfile,
+				Routes: []apis.RouteConfig{{Destination: "fdcd:8150::/32", Gateway: testRailRouter}}},
+			wantChild: railChild,
+		},
+		{
+			name:      "user rules need no default route",
+			ifName:    "rdma_vf_rail3",
+			addresses: parent,
+			config: &apis.NetworkConfig{Profile: okeRDMAProfile,
+				Rules: []apis.RuleConfig{{Priority: 100, Source: "fdcd:8150:5654:70c1::/64", Table: 300}}},
+			wantChild: railChild,
+		},
+		{
 			// Joining a VRF would drop the child's static IPv6 address.
 			name:      "user VRF is rejected",
 			ifName:    "rdma_vf_rail3",
@@ -371,7 +391,26 @@ func TestIPv6ProfileConfig(t *testing.T) {
 			name:      "no default route yet",
 			ifName:    "rdma_vf_rail3",
 			addresses: parent,
-			wantErr:   "no IPv6 default route",
+			wantErr:   "no IPv6 default route yet",
+		},
+		{
+			// Another interface's nexthop-object route does not hide that the
+			// parent may only be waiting for its advertisement.
+			name:       "no default route and unreadable routes name both causes",
+			ifName:     "rdma_vf_rail3",
+			addresses:  parent,
+			unreadable: 2,
+			wantErr:    "advertisement may not have installed it yet, or it is one of the 2 default route(s) on the host whose next hop the profile cannot read",
+		},
+		{
+			// An unreadable route elsewhere is ignored once the parent has one.
+			name:       "unreadable routes with a readable router",
+			ifName:     "rdma_vf_rail3",
+			addresses:  parent,
+			routers:    router,
+			unreadable: 1,
+			wantChild:  railChild,
+			wantTable:  119,
 		},
 		{
 			name:      "index above the largest shape",
@@ -429,7 +468,7 @@ func TestIPv6ProfileConfig(t *testing.T) {
 			}
 			fakeInterface(t, tt.ifName, "0000:11:00.4", hardwareType)
 			fakeIPv6Addresses(t, tt.ifName, tt.addresses...)
-			fakeIPv6Routers(t, map[string][]ipv6Router{tt.ifName: tt.routers})
+			fakeIPv6Routers(t, map[string][]ipv6Router{tt.ifName: tt.routers}, tt.unreadable)
 			config := tt.config
 			if config == nil {
 				config = profileConfig(apis.InterfaceConfig{})
