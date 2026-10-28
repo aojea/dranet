@@ -31,17 +31,11 @@ permissions:
 
 jobs:
   bats_tests:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-26.04
     name: Bats e2e tests
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: system-level-dependencies
-        run: |
-          sudo apt update
-          sudo apt -y install linux-modules-extra-$(uname -r)
-          sudo modprobe -v vrf
 
       - name: Set up environment (download dependencies)
         run: |
@@ -51,9 +45,8 @@ jobs:
           # kind
           curl -Lo "${TMP_DIR}/kind" "https://kind.sigs.k8s.io/dl/${{ env.KIND_VERSION }}/kind-linux-amd64"
           # Install
-          sudo cp "${TMP_DIR}/kubectl" /usr/local/bin/kubectl
-          sudo cp "${TMP_DIR}/kind" /usr/local/bin/kind
-          sudo chmod +x /usr/local/bin/*
+          sudo install -m 0755 "${TMP_DIR}/kubectl" /usr/local/bin/kubectl
+          sudo install -m 0755 "${TMP_DIR}/kind" /usr/local/bin/kind
           # Clean
           sudo rm -rf "${TMP_DIR}"
 
