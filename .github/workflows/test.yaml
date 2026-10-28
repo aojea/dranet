@@ -38,6 +38,12 @@ jobs:
         go-version: ${{ matrix.go-version }}
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+    # The VRF tests need the vrf module, which the runner kernel ships in
+    # linux-modules-extra, as bats.yml does for the e2e tests.
+    - run: |
+        sudo apt-get update
+        sudo apt-get -y install linux-modules-extra-$(uname -r)
+        sudo modprobe -v vrf
     - run: make test
     - run: make lint
     - run: make verify

@@ -18,6 +18,7 @@ package driver
 
 import (
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"path"
 	"runtime"
@@ -187,6 +188,11 @@ func test_applyVRFConfigKeepsIPv6Addresses(t *testing.T) {
 		t.Fatalf("nsAttachNetdev() error = %v", err)
 	}
 	if _, err := applyVRFConfig(containerNsPath, ifaceName, cfg.VRF); err != nil {
+		// A kernel without the vrf module, as on a CI runner without
+		// linux-modules-extra, cannot create the device.
+		if errors.Is(err, syscall.EOPNOTSUPP) {
+			t.Skipf("the kernel does not support VRF devices: %v", err)
+		}
 		t.Fatalf("applyVRFConfig() error = %v", err)
 	}
 
