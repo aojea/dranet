@@ -38,6 +38,14 @@ jobs:
         go-version: ${{ matrix.go-version }}
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+    # The VRF tests need the vrf module. Ubuntu 26.04 ships it with the
+    # kernel; older images have it in linux-modules-extra, as in bats.yml.
+    - run: |
+        sudo modprobe -v vrf || {
+          sudo apt-get update &&
+          sudo apt-get -y install linux-modules-extra-$(uname -r) &&
+          sudo modprobe -v vrf
+        }
     - run: make test
     - run: make lint
     - run: make verify
