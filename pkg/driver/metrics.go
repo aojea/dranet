@@ -91,7 +91,9 @@ var (
 		Help:      "The timestamp of the last successful resource publication.",
 	})
 	// nriPluginDisconnectsTotal counts containerd closing an already-open
-	// ttrpc connection (stub.WithOnClose), e.g. on plugin_request_timeout. A
+	// ttrpc connection (stub.WithOnClose), e.g. on plugin_request_timeout
+	// with a runtime that does not support the NRI failure policy
+	// (stub.WithFailurePolicy in driver.go). A
 	// strict subset of nriPluginReconnectAttemptsTotal below: it only fires
 	// once a connection exists, so it misses retries from a failed
 	// stub.connect() or stub.register() (socket not up yet, registration
