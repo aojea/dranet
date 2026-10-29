@@ -184,8 +184,15 @@ artifacts to
 
 - name: charts/dranet
   dmap:
-    "sha256:<CHART_DIGEST>": ["1.4.0"]
+    "sha256:<CHART_DIGEST>": ["1.4.0", "v1.4.0"]
 ```
+
+> [!NOTE]
+> Helm requires the `version` field in `Chart.yaml` to be plain SemVer (no `v`
+> prefix), so the chart must be tagged `1.4.0` to match it. Also keep the
+> `v`-prefixed tag (`v1.4.0`) on the chart for users already pulling it that
+> way. The container image keeps only the `v`-prefixed tag. See
+> [#376](https://github.com/kubernetes-sigs/dranet/issues/376).
 
 Once the PR is merged, the
 [`post-k8sio-image-promo`](https://testgrid.k8s.io/sig-k8s-infra-k8sio#post-k8sio-image-promo)
@@ -204,6 +211,7 @@ crane digest registry.k8s.io/networking/dranet:v1.4.0
 
 # Verify Helm chart artifact
 crane digest registry.k8s.io/networking/charts/dranet:1.4.0
+crane digest registry.k8s.io/networking/charts/dranet:v1.4.0
 # or
 helm show chart oci://registry.k8s.io/networking/charts/dranet --version 1.4.0
 ```
