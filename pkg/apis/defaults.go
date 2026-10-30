@@ -42,7 +42,7 @@ func (c *VRFConfig) Default() {
 func TableIDForName(name string) int {
 	h := fnv.New32a()
 	h.Write([]byte(name))
-	return int((h.Sum32() % 1000) + RouteTableOffset)
+	return int(h.Sum32()%RouteTableRange) + RouteTableOffset
 }
 
 // Default applies default values to the IPVlanConfig.
