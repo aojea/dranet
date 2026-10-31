@@ -35,6 +35,13 @@ const (
 	// tables (0, 253, 254, 255) and to identify DRANET managed tables.
 	RouteTableOffset = 1000
 
+	// RouteTableRange is the number of routing table IDs, starting at
+	// RouteTableOffset, that DRANET derives from names (1 << 30 = 1,073,741,824).
+	// By the birthday paradox, for k = 16 devices in one pod (C(16,2) = 120 pairs),
+	// the collision probability is ~120 / 2^30 ≈ 1.1e-7, while every derived ID
+	// (RouteTableOffset + [0, 2^30)) still fits in a signed int32.
+	RouteTableRange = 1 << 30
+
 	// SourceRoutingRulePriority is the priority for provider-generated source
 	// based routing rules. It must be lower than the kernel's implicit "main"
 	// table rule (32766) so matching traffic is routed via the interface's

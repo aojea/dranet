@@ -86,8 +86,8 @@ const (
 	// by this provider into an IPvlan child with a deterministic address.
 	okeRDMAProfile = "oke-rdma"
 	// okeRDMASBRTableBase plus the RDMA NIC index is the routing table of a child.
-	// TableIDForName hashes into 1000 to 1999 and can collide between two
-	// RDMA NICs of one pod; the RDMA NIC index cannot.
+	// TableIDForName hashes names and can collide between two RDMA NICs of
+	// one pod; the RDMA NIC index cannot.
 	okeRDMASBRTableBase = 100
 	// okeMaxIPv4RDMANics is the largest RDMA NIC count of an OKE shape on an
 	// IPv4 RDMA fabric. It bounds the RDMA NIC index, and with it the routing
